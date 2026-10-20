@@ -43,6 +43,9 @@ pub enum Request {
     SignedIn,
     /// Reconnect live updates now, skipping any backoff wait.
     Reconnect { library: Option<String> },
+    /// Read the config file again (after `add`, `remove` or `setup` changed it). `config` is the file the sender
+    /// changed; a host running from a different one refuses.
+    Reload { config: PathBuf },
 }
 
 fn default_history() -> usize {
@@ -183,6 +186,16 @@ async fn handle(conn: Stream, svc: Service) -> Result<()> {
             Ok(()) => Response::Ok,
             Err(e) => Response::Error { message: format!("{e:#}") },
         },
+        Request::Reload { config } => match svc.config_file() {
+            Some(mine) if same_file(&mine, &config) => match svc.reload_file().await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: format!("{e:#}") },
+            },
+            Some(mine) => Response::Error {
+                message: format!("the running host uses {}, not {}; it was left as it is", mine.display(), config.display()),
+            },
+            None => Response::Error { message: "the running host wasn't started from a config file".into() },
+        },
         Request::Subscribe => {
             let mut rx = svc.subscribe();
             write(&mut send, &Response::Ok).await?;
@@ -197,6 +210,11 @@ async fn handle(conn: Stream, svc: Service) -> Result<()> {
         }
     };
     write(&mut send, &resp).await
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    canon(a) == canon(b)
 }
 
 async fn write(send: &mut (impl AsyncWriteExt + Unpin), resp: &Response) -> Result<()> {

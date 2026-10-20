@@ -28,6 +28,7 @@ pub mod account;
 #[cfg(unix)]
 pub mod cli_link;
 pub mod index;
+pub mod links;
 mod lock;
 mod service;
 mod sync;

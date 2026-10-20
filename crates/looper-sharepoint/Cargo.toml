@@ -22,8 +22,11 @@ looper-sharepoint-ipc = { version = "0.1.0", path = "../looper-sharepoint-ipc" }
 tokio = { version = "1.53.2", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+dirs = "7.0.0"
 
 [dev-dependencies]
 bytes = "1.12.1"
 futures-util = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
+url = "2.5.8"

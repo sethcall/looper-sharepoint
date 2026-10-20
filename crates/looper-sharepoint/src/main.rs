@@ -4,6 +4,7 @@
 //! TUI. Everything sync-related lives in the engine; this file is argument parsing and presentation.
 
 mod fmt;
+mod onboard;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -59,6 +60,40 @@ enum Cmd {
     Logout,
     /// Show the signed-in account
     Whoami,
+    /// Start syncing a SharePoint site, library or folder: paste its link from the browser
+    #[command(after_help = ADD_EXAMPLES)]
+    Add {
+        /// A link copied from the browser's address bar (a site, a library, or a folder), a sharing link to a folder,
+        /// or a looper-sharepoint://add link
+        link: String,
+        /// The local folder to sync into: anywhere, new or empty. The SharePoint folder's contents go straight into
+        /// it. Default: asked on a terminal, suggesting <sync.root>/<site or folder name>
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// For a link to a site with several libraries: which one (by name). Default: the site's main library
+        #[arg(long)]
+        library: Option<String>,
+        /// What commands and status call it. Default: the local folder's name
+        #[arg(long)]
+        name: Option<String>,
+        /// Only download: never upload local changes to this library
+        #[arg(long)]
+        read_only: bool,
+        /// Don't do the first sync now
+        #[arg(long)]
+        no_sync: bool,
+        /// Use a folder that already has files: files matching SharePoint's are kept, files only here are uploaded
+        #[arg(long)]
+        adopt: bool,
+        /// Don't ask for the folder; use --to, or the suggestion
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop syncing a library. Never deletes files, here or in SharePoint
+    Remove {
+        /// The library's name (as `status` shows it)
+        name: String,
+    },
     /// List sites and document libraries you can access, as ready-to-paste [[library]] blocks
     Libraries {
         /// Only this site (URL)
@@ -142,6 +177,17 @@ enum Cmd {
         yes: bool,
     },
 }
+
+const ADD_EXAMPLES: &str = "\
+Examples:
+  looper-sharepoint add https://contoso.sharepoint.com/sites/Engineering --to ~/work/engineering
+  looper-sharepoint add \"https://contoso.sharepoint.com/sites/Engineering/Shared Documents/Specs\" --to ~/work/specs
+  looper-sharepoint add \"https://contoso.sharepoint.com/sites/Engineering/Shared%20Documents/Forms/AllItems.aspx?id=%2Fsites%2FEngineering%2FShared%20Documents%2FSpecs\"
+  looper-sharepoint add https://contoso.sharepoint.com/:f:/s/Engineering/EaBcD… --to ~/work/specs --read-only
+  looper-sharepoint add https://contoso.sharepoint.com/sites/Engineering --library \"Design Files\" --yes
+
+A folder link syncs just that folder, its contents directly into --to. A running looper-sharepoint (the menu-bar
+app or `run`) picks the new library up at once; otherwise `add` does the first sync itself.";
 
 /// A folder or file: a local path in a synced library folder, or `--library NAME` and a path in that library.
 #[derive(clap::Args)]
@@ -324,6 +370,11 @@ async fn run(cli: Cli, tui: bool, log_file: &Path) -> Result<ExitCode> {
                 println!("app: {} (client id {})", cfg.account.app_name, cfg.account.client_id);
             }
         }
+        Cmd::Add { link, to, library, name, read_only, no_sync, adopt, yes } => {
+            let args = onboard::AddArgs { link, to, library, name, read_only, no_sync, adopt, yes };
+            return onboard::add(&config_path, &data, args, cli.json).await;
+        }
+        Cmd::Remove { name } => return onboard::remove(&config_path, &data, &name, cli.json).await,
         Cmd::Libraries { site } => {
             let cfg = load()?;
             libraries(&graph(&cfg)?, site.as_deref(), cli.json).await?;
@@ -349,17 +400,17 @@ async fn run(cli: Cli, tui: bool, log_file: &Path) -> Result<ExitCode> {
         Cmd::Sync { library, dry_run, allow_mass_delete } => {
             let cfg = load()?;
             if cfg.libraries.is_empty() {
-                bail!("no [[library]] entries in {}; `looper-sharepoint libraries` lists what you can sync", config_path.display());
+                bail!("nothing to sync yet: add a SharePoint site or folder with `looper-sharepoint add <link>`");
             }
             if let Some(l) = &library {
-                cfg.library(l).with_context(|| format!("no library with local = {l:?} in config"))?;
+                cfg.library(l).with_context(|| format!("no library named {l:?} (`looper-sharepoint status` lists them)"))?;
             }
             let opts = RunOptions { dry_run, allow_mass_delete };
             return sync(&cfg, &data, library, opts, cli.json).await;
         }
         Cmd::Run { .. } => {
             let cfg = load()?;
-            return host(cfg, data, tui, log_file).await;
+            return host(cfg, &config_path, data, tui, log_file).await;
         }
         Cmd::Trigger { library, reconnect } => {
             let req = if reconnect { Request::Reconnect { library } } else { Request::Trigger { library } };
@@ -496,12 +547,13 @@ fn one_shot_record(
 }
 
 /// `run`: host the service in the foreground.
-async fn host(cfg: Config, data: PathBuf, tui: bool, log_file: &Path) -> Result<ExitCode> {
-    if cfg.libraries.is_empty() {
-        bail!("no [[library]] entries in config; `looper-sharepoint libraries` lists what you can sync");
+async fn host(cfg: Config, config_path: &Path, data: PathBuf, tui: bool, log_file: &Path) -> Result<ExitCode> {
+    if cfg.libraries.is_empty() && !tui {
+        eprintln!("Nothing to sync yet. Add a SharePoint site or folder with `looper-sharepoint add <link>`; this picks it up.");
     }
     let tokens = tokens(&cfg, false)?;
     let svc = Service::start(ServiceConfig { config: cfg, tokens, data_dir: data })?;
+    svc.set_config_file(&std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_owned()));
     let _ipc = looper_sharepoint_ipc::serve(svc.clone())?;
     if tui {
         tui::run(svc.clone(), log_file).await?;
@@ -918,6 +970,15 @@ fn uninstall_cli(data: &Path, yes: bool) -> Result<ExitCode> {
     }
     cli_link::clear_record(data)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Ask for a value on the terminal, with a default taken on an empty answer.
+fn prompt(question: &str, default: &str) -> Result<String> {
+    eprint!("{question} [{default}]: ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(if answer.is_empty() { default.to_string() } else { answer.to_string() })
 }
 
 /// Ask a yes/no question on the terminal. Not on a terminal: refuse, so scripts must say --yes.

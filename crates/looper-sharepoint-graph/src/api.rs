@@ -16,6 +16,12 @@ fn enc_path(p: &str) -> String {
         .join("/")
 }
 
+/// `u!` + unpadded base64url of the link: how `/shares` takes a URL.
+fn share_id(link: &str) -> String {
+    use base64::Engine;
+    format!("u!{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(link.as_bytes()))
+}
+
 /// Upload chunk size: a multiple of 320 KiB, ~10 MiB.
 pub const CHUNK: usize = 320 * 1024 * 32;
 
@@ -41,6 +47,34 @@ impl GraphClient {
         let path = u.path().trim_end_matches('/');
         let p = if path.is_empty() { format!("/sites/{host}") } else { format!("/sites/{host}:{path}") };
         self.get_json(&format!("{p}?$select=id,displayName,name,webUrl")).await
+    }
+
+    /// The item a SharePoint link points to: a sharing link, or a plain link to a folder, library or file
+    /// (including the browser's `Forms/AllItems.aspx?id=…` pages). <https://learn.microsoft.com/graph/api/shares-get>
+    pub async fn shared_item(&self, link: &str) -> Result<DriveItem> {
+        self.get_json(&format!(
+            "/shares/{}/driveItem?$select=id,name,folder,file,root,parentReference,webUrl,sharepointIds",
+            share_id(link)
+        ))
+        .await
+    }
+
+    /// The site a SharePoint link points to (for a link to a site, which [`shared_item`](Self::shared_item) refuses).
+    pub async fn shared_site(&self, link: &str) -> Result<Site> {
+        self.get_json(&format!("/shares/{}/site?$select=id,displayName,name,webUrl", share_id(link))).await
+    }
+
+    pub async fn drive(&self, drive_id: &str) -> Result<Drive> {
+        self.get_json(&format!("/drives/{drive_id}?$select=id,name,driveType,webUrl")).await
+    }
+
+    /// The site's default document library.
+    pub async fn site_default_drive(&self, site_id: &str) -> Result<Drive> {
+        self.get_json(&format!("/sites/{site_id}/drive?$select=id,name,driveType,webUrl")).await
+    }
+
+    pub async fn site(&self, site_id: &str) -> Result<Site> {
+        self.get_json(&format!("/sites/{site_id}?$select=id,displayName,name,webUrl")).await
     }
 
     pub async fn site_drives(&self, site_id: &str) -> Result<Vec<Drive>> {

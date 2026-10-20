@@ -142,6 +142,7 @@ async fn start(config_path: PathBuf, data: PathBuf) -> AppState {
         };
     match Service::start(ServiceConfig { config, tokens, data_dir: data }) {
         Ok(svc) => {
+            svc.set_config_file(&std::fs::canonicalize(&config_path).unwrap_or(config_path));
             match looper_sharepoint_ipc::serve(svc.clone()) {
                 Ok(server) => st._ipc = Some(server),
                 Err(e) => tracing::warn!("control socket unavailable: {e:#}"),

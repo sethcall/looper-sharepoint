@@ -25,6 +25,7 @@ tokio = { version = "1.53.2", features = ["rt", "macros", "sync", "time", "fs", 
 tracing = "0.1.44"
 gethostname = "1.1.0"
 notify = "8"
+url = "2.5.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

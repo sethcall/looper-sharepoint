@@ -38,6 +38,11 @@ let svc = Service::start(ServiceConfig { config, tokens, data_dir: data })?;   /
   `LockError::Held` with the other process's pid.
 - loads each library's run history.
 - starts one scheduler per library. Each library syncs once immediately.
+
+**Changing the config while running:** `svc.reload(new_config).await` lets runs in progress finish, then sets every
+library up again from `new_config` (each syncs once). State, pause, history and event subscribers carry over. A
+different tenant or app is refused. A host that keeps its config in a file calls `svc.set_config_file(path)`; then
+`svc.reload_file()` re-reads it, and so does the CLI's `reload` request (sent by `add`, `remove` and `setup`).
 - with `sync.push` (the default), opens a live-updates connection per library
   ([docs/sharepoint/push.md](sharepoint/push.md)).
   - While a library is Live, it runs on each change notification, plus a safety check every

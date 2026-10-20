@@ -7,7 +7,8 @@ library, a SharePoint folder synced directly into it).
 |---|---|
 | Probe: `/shares` for plain links | Done: it resolves folder and library URLs, `AllItems.aspx?id=` pages, file URLs and sharing links to the item. A site URL gives 400 for `driveItem`, but `/shares/{url}/site` works |
 | §3 a folder per library, a folder as the root | Built; live test `folder_as_library_root` |
-| §5, §6 `add`, `remove`, reload | Next |
+| §5, §6 `add`, `remove`, reload (CLI and `run`) | Built; live tests `add_and_remove_from_links`, `running_host_reloads_after_add` |
+| §5, §6 in the tray: Add window, reload, saved config file | Next |
 | §4, §7 setup file and links | |
 | §8 start at login | |
 | §9, §10 help, quickstart, README | |
@@ -159,7 +160,7 @@ The link is whatever the user copied from the browser or from Teams' "Open in Sh
 
 | Link | Adds |
 |---|---|
-| A site: `https://contoso.sharepoint.com/sites/Engineering` | The site's document library. If it has several, it lists them and asks for `--library` |
+| A site: `https://contoso.sharepoint.com/sites/Engineering` | The site's main document library (`--library NAME` for another; the others are listed) |
 | A library: `…/sites/Engineering/Shared%20Documents`, or its `Forms/AllItems.aspx` page | That library |
 | A folder: `…/Forms/AllItems.aspx?id=%2Fsites%2FEngineering%2FShared%20Documents%2FSpecs&viewid=…`, or `…/Shared%20Documents/Specs` | That folder, directly into `--to` (`folder = "Specs"`) |
 | A sharing link to a folder: `https://contoso.sharepoint.com/:f:/s/Engineering/E…` | The same, found through Graph's `/shares` |
@@ -188,8 +189,10 @@ The link is whatever the user copied from the browser or from Teams' "Open in Sh
   opens the tray's Add window to confirm. `to` is only the suggestion in the folder picker.
   - A link never adds anything by itself.
   - It never picks a non-empty folder without the user choosing it.
-- **`remove <name>`:** takes a library out of the config. It never deletes files, local or in SharePoint, and says
-  where the local copy and its state are.
+- **`remove <name>`:** takes a library out of the config. It never deletes files, local or in SharePoint.
+  - It forgets the library's sync state (the state DB isn't the user's data), so adding it again later, perhaps to
+    another folder, starts fresh instead of finding a "missing" local folder. Not when a running host failed to
+    reload: that host may still be syncing it.
 - **The tray:** **Add a SharePoint Folder…** opens the Add window. It has a paste box and a folder picker, and runs
   the same checks with the same errors.
 

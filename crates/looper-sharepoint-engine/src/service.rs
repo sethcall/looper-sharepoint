@@ -57,10 +57,20 @@ pub struct ServiceConfig {
     pub data_dir: PathBuf,
 }
 
-/// A running sync service. Cheap to clone; all clones control the same service.
+/// A running sync service. Cheap to clone; all clones control the same service, also across a [`Service::reload`].
 #[derive(Clone)]
 pub struct Service {
-    inner: Arc<Inner>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    /// The schedulers for the current config. A reload swaps in a new one.
+    current: std::sync::RwLock<Arc<Inner>>,
+    data_dir: PathBuf,
+    /// The config file this service runs from, if it has one (see [`Service::set_config_file`]).
+    config_file: Mutex<Option<PathBuf>>,
+    /// One reload at a time.
+    reloading: tokio::sync::Mutex<()>,
 }
 
 struct Inner {
@@ -75,7 +85,8 @@ struct Inner {
     started_at: DateTime<Utc>,
     history: Mutex<VecDeque<RunRecord>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    _lock: HostLock,
+    /// Shared by every `Inner` of this service, so a reload never lets another host in.
+    lock: Arc<HostLock>,
 }
 
 struct Lib {
@@ -100,71 +111,78 @@ impl Service {
     /// Start the service: take the host lock, load history, and spawn one scheduler per library (each runs once at
     /// startup). Must be called from within a tokio runtime.
     pub fn start(sc: ServiceConfig) -> Result<Self> {
-        let lock = HostLock::acquire(&sc.data_dir)?;
-        crate::account::configure_client(&sc.config);
-        let graph = GraphClient::with_rate(sc.tokens.clone(), sc.config.sync.max_requests_per_second);
+        let lock = Arc::new(HostLock::acquire(&sc.data_dir)?);
         let (events, _) = broadcast::channel(1024);
-        let mut receivers = vec![];
-        let mut libs = vec![];
-        let mut history: Vec<RunRecord> = vec![];
-        for lib in &sc.config.libraries {
-            let (tx, rx) = mpsc::unbounded_channel();
-            receivers.push(rx);
-            let (status, runs) = initial_status(&sc.config, &sc.data_dir, lib);
-            history.extend(runs);
-            libs.push(Lib {
-                cfg: lib.clone(),
-                status: Mutex::new(status),
-                tx,
-                push_changed: Notify::new(),
-                reconnect: Notify::new(),
-                own_writes: Mutex::new(HashMap::new()),
-            });
-        }
-        history.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-        history.truncate(HISTORY_IN_MEMORY);
-
-        let inner = Arc::new(Inner {
-            cfg: sc.config,
-            graph,
-            tokens: sc.tokens,
-            data_dir: sc.data_dir,
-            events,
-            libs,
-            paused: watch::channel(false).0,
-            shutdown: watch::channel(false).0,
-            started_at: Utc::now(),
-            history: Mutex::new(history.into()),
-            tasks: Mutex::new(vec![]),
-            _lock: lock,
-        });
-        let mut tasks = vec![];
-        for (idx, rx) in receivers.into_iter().enumerate() {
-            tasks.push(tokio::spawn(library_loop(inner.clone(), idx, rx)));
-            if inner.cfg.sync.push {
-                tasks.push(tokio::spawn(push_loop(inner.clone(), idx)));
-            }
-            if inner.cfg.sync.watch && inner.cfg.uploads(&inner.libs[idx].cfg) {
-                tasks.push(tokio::spawn(watch_loop(inner.clone(), idx)));
-            }
-        }
-        tasks.push(tokio::spawn(throttle_watch(inner.clone())));
-        *inner.tasks.lock().unwrap() = tasks;
+        let inner = Inner::start(sc.config, sc.tokens, sc.data_dir.clone(), events, lock, false, None);
         tracing::info!(libraries = inner.libs.len(), "sync service started");
-        Ok(Self { inner })
+        Ok(Self {
+            shared: Arc::new(Shared {
+                current: std::sync::RwLock::new(inner),
+                data_dir: sc.data_dir,
+                config_file: Mutex::new(None),
+                reloading: tokio::sync::Mutex::new(()),
+            }),
+        })
     }
 
-    pub fn config(&self) -> &Config {
-        &self.inner.cfg
+    fn inner(&self) -> Arc<Inner> {
+        self.shared.current.read().unwrap().clone()
+    }
+
+    /// Switch to `config` (already parsed and checked): runs in flight finish, then every library is set up again
+    /// from the new config, and each syncs once. Libraries keep their state; pause, history and subscribers carry
+    /// over. A different account (tenant or app) is refused: that needs a new sign-in, so a restart.
+    pub async fn reload(&self, config: Config) -> Result<()> {
+        let _one = self.shared.reloading.lock().await;
+        let old = self.inner();
+        let (a, b) = (&old.cfg.account, &config.account);
+        if !a.tenant.eq_ignore_ascii_case(&b.tenant) || !a.client_id.eq_ignore_ascii_case(&b.client_id) {
+            bail!("the config now names a different organization or app; quit and start again, then sign in");
+        }
+        old.shutdown.send_replace(true);
+        let tasks: Vec<_> = std::mem::take(&mut *old.tasks.lock().unwrap());
+        for t in tasks {
+            let _ = t.await;
+        }
+        let history: Vec<RunRecord> = old.history.lock().unwrap().iter().cloned().collect();
+        let paused = *old.paused.borrow();
+        let new = Inner::start(config, old.tokens.clone(), self.shared.data_dir.clone(), old.events.clone(), old.lock.clone(), paused, Some(history));
+        tracing::info!(libraries = new.libs.len(), "config reloaded");
+        *self.shared.current.write().unwrap() = new;
+        self.changed();
+        Ok(())
+    }
+
+    /// Name the config file this service was started from, so [`Service::reload_file`] (and a `reload` request from
+    /// the CLI) can read it again. Hosts that keep the config elsewhere don't call this.
+    pub fn set_config_file(&self, path: &Path) {
+        *self.shared.config_file.lock().unwrap() = Some(path.to_owned());
+    }
+
+    pub fn config_file(&self) -> Option<PathBuf> {
+        self.shared.config_file.lock().unwrap().clone()
+    }
+
+    /// Read the config file again and [`reload`](Service::reload) it. A file that doesn't parse or check keeps the
+    /// current config running, and the error says why.
+    pub async fn reload_file(&self) -> Result<()> {
+        let path = self.config_file().context("this host wasn't started from a config file")?;
+        let config = Config::load(&path).with_context(|| format!("not reloaded: {} has a problem; still using the previous config", path.display()))?;
+        self.reload(config).await
+    }
+
+    /// The current config.
+    pub fn config(&self) -> Config {
+        self.inner().cfg.clone()
     }
 
     pub fn data_dir(&self) -> &Path {
-        &self.inner.data_dir
+        &self.shared.data_dir
     }
 
     /// A snapshot of everything a host might render.
     pub fn status(&self) -> Status {
-        let i = &self.inner;
+        let i = self.inner();
         let stats = i.graph.stats();
         Status {
             account: i.tokens.username(),
@@ -184,17 +202,18 @@ impl Service {
 
     /// Recent runs across all libraries, newest first.
     pub fn history(&self, limit: usize) -> Vec<RunRecord> {
-        self.inner.history.lock().unwrap().iter().take(limit).cloned().collect()
+        self.inner().history.lock().unwrap().iter().take(limit).cloned().collect()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.inner.events.subscribe()
+        self.inner().events.subscribe()
     }
 
     /// Ask for a run now (all libraries if `library` is `None`). Returns immediately. A request made while a run is
     /// in flight is coalesced into one follow-up run.
     pub fn trigger(&self, library: Option<&str>, trigger: Trigger) -> Result<()> {
-        for lib in self.select(library)? {
+        let inner = self.inner();
+        for lib in select(&inner, library)? {
             let _ = lib.tx.send(Request { trigger, opts: RunOptions::default(), reply: None });
         }
         Ok(())
@@ -203,7 +222,8 @@ impl Service {
     /// Run now and wait for the results (all libraries if `library` is `None`).
     pub async fn sync_now(&self, library: Option<&str>, opts: RunOptions) -> Result<Vec<RunResult>> {
         let mut waits = vec![];
-        for lib in self.select(library)? {
+        let inner = self.inner();
+        for lib in select(&inner, library)? {
             let (tx, rx) = oneshot::channel();
             lib.tx
                 .send(Request { trigger: Trigger::Manual, opts: opts.clone(), reply: Some(tx) })
@@ -219,7 +239,8 @@ impl Service {
 
     /// Reconnect live updates now (all libraries if `library` is `None`), skipping any backoff wait.
     pub fn reconnect_push(&self, library: Option<&str>) -> Result<()> {
-        for lib in self.select(library)? {
+        let inner = self.inner();
+        for lib in select(&inner, library)? {
             lib.reconnect.notify_one();
         }
         Ok(())
@@ -227,19 +248,19 @@ impl Service {
 
     /// Stop scheduled runs. Manual runs still happen.
     pub fn pause(&self) {
-        self.inner.paused.send_replace(true);
+        self.inner().paused.send_replace(true);
         self.changed();
     }
 
     pub fn resume(&self) {
-        self.inner.paused.send_replace(false);
+        self.inner().paused.send_replace(false);
         self.changed();
     }
 
     /// Tell the service the user just signed in, so libraries waiting on sign-in run now instead of at the next
     /// recheck.
     pub fn signed_in(&self) {
-        for lib in &self.inner.libs {
+        for lib in &self.inner().libs {
             if lib.status.lock().unwrap().state == LibraryState::SignInRequired {
                 let _ = lib.tx.send(Request { trigger: Trigger::Manual, opts: RunOptions::default(), reply: None });
             }
@@ -250,26 +271,97 @@ impl Service {
     /// Stop the schedulers. A run in flight is allowed to finish (so the state DB and disk stay consistent); hosts
     /// that need to exit immediately can simply drop the runtime instead.
     pub async fn shutdown(&self) {
-        self.inner.shutdown.send_replace(true);
-        let tasks: Vec<_> = std::mem::take(&mut *self.inner.tasks.lock().unwrap());
+        let inner = self.inner();
+        inner.shutdown.send_replace(true);
+        let tasks: Vec<_> = std::mem::take(&mut *inner.tasks.lock().unwrap());
         for t in tasks {
             let _ = t.await;
         }
         tracing::info!("sync service stopped");
     }
 
-    fn select(&self, library: Option<&str>) -> Result<Vec<&Lib>> {
-        match library {
-            None => Ok(self.inner.libs.iter().collect()),
-            Some(name) => match self.inner.libs.iter().find(|l| l.cfg.local.eq_ignore_ascii_case(name)) {
-                Some(l) => Ok(vec![l]),
-                None => bail!("no library with local = {name:?} in config"),
-            },
-        }
-    }
-
     fn changed(&self) {
-        let _ = self.inner.events.send(Event::StatusChanged);
+        let _ = self.inner().events.send(Event::StatusChanged);
+    }
+}
+
+fn select<'a>(inner: &'a Inner, library: Option<&str>) -> Result<Vec<&'a Lib>> {
+    match library {
+        None => Ok(inner.libs.iter().collect()),
+        Some(name) => match inner.libs.iter().find(|l| l.cfg.local.eq_ignore_ascii_case(name)) {
+            Some(l) => Ok(vec![l]),
+            None => bail!("no library named {name:?} in config"),
+        },
+    }
+}
+
+impl Inner {
+    /// Set up the libraries of `cfg` and spawn their schedulers. `history` carries over from a previous config.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        cfg: Config,
+        tokens: Arc<dyn TokenProvider>,
+        data_dir: PathBuf,
+        events: broadcast::Sender<Event>,
+        lock: Arc<HostLock>,
+        paused: bool,
+        history: Option<Vec<RunRecord>>,
+    ) -> Arc<Inner> {
+        crate::account::configure_client(&cfg);
+        let graph = GraphClient::with_rate(tokens.clone(), cfg.sync.max_requests_per_second);
+        let mut receivers = vec![];
+        let mut libs = vec![];
+        let mut runs: Vec<RunRecord> = vec![];
+        for lib in &cfg.libraries {
+            let (tx, rx) = mpsc::unbounded_channel();
+            receivers.push(rx);
+            let (status, r) = initial_status(&cfg, &data_dir, lib);
+            runs.extend(r);
+            libs.push(Lib {
+                cfg: lib.clone(),
+                status: Mutex::new(status),
+                tx,
+                push_changed: Notify::new(),
+                reconnect: Notify::new(),
+                own_writes: Mutex::new(HashMap::new()),
+            });
+        }
+        let history = match history {
+            Some(h) => h,
+            None => {
+                runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+                runs
+            }
+        };
+        let mut history: VecDeque<RunRecord> = history.into();
+        history.truncate(HISTORY_IN_MEMORY);
+        let inner = Arc::new(Inner {
+            cfg,
+            graph,
+            tokens,
+            data_dir,
+            events,
+            libs,
+            paused: watch::channel(paused).0,
+            shutdown: watch::channel(false).0,
+            started_at: Utc::now(),
+            history: Mutex::new(history),
+            tasks: Mutex::new(vec![]),
+            lock,
+        });
+        let mut tasks = vec![];
+        for (idx, rx) in receivers.into_iter().enumerate() {
+            tasks.push(tokio::spawn(library_loop(inner.clone(), idx, rx)));
+            if inner.cfg.sync.push {
+                tasks.push(tokio::spawn(push_loop(inner.clone(), idx)));
+            }
+            if inner.cfg.sync.watch && inner.cfg.uploads(&inner.libs[idx].cfg) {
+                tasks.push(tokio::spawn(watch_loop(inner.clone(), idx)));
+            }
+        }
+        tasks.push(tokio::spawn(throttle_watch(inner.clone())));
+        *inner.tasks.lock().unwrap() = tasks;
+        inner
     }
 }
 

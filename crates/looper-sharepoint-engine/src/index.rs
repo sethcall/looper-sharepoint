@@ -80,6 +80,16 @@ pub fn invalidate(data_dir: &Path, local: &str) -> Result<()> {
     Ok(())
 }
 
+/// Drop the library named `name` from the index, and return its entry (whose state DB the caller may delete).
+pub fn forget(data_dir: &Path, name: &str) -> Result<Option<Entry>> {
+    let mut idx = load(data_dir)?;
+    let e = idx.remove(&name.to_lowercase());
+    if e.is_some() {
+        save(data_dir, &idx)?;
+    }
+    Ok(e)
+}
+
 fn save(data_dir: &Path, idx: &BTreeMap<String, Entry>) -> Result<()> {
     std::fs::create_dir_all(data_dir.join("state"))?;
     std::fs::write(file(data_dir), serde_json::to_string_pretty(idx)?)?;

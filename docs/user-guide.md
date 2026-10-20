@@ -40,8 +40,17 @@ folder under `sync.root`.
 3. **Sign in:** `looper-sharepoint login` opens your browser. Use `--device-code` on a machine without one.
    - The sign-in is kept in the macOS keychain.
    - `whoami` shows the account; `logout` forgets it.
-4. **Pick libraries:** `looper-sharepoint libraries` lists the sites and libraries you can access, as ready-to-paste
-   `[[library]]` blocks. Paste the ones you want into the config.
+4. **Add what to sync:** in SharePoint, open the site, library or folder, copy the address from the browser, and run
+   `looper-sharepoint add "<link>" --to ~/any/folder`.
+   - It accepts a site, a library, a folder (also the browser's `Forms/AllItems.aspx?id=…` address), or a sharing
+     link to a folder. A folder's contents go straight into `--to`.
+   - It writes the `[[library]]` block for you, keeping the config's comments, and does the first sync. A running
+     host (`run` or the tray) picks it up at once.
+   - `--to` must be new or empty (`--adopt` uses a folder with files; files only there are uploaded). `--read-only`
+     never uploads. `--library NAME` picks a library on a site with several.
+   - `looper-sharepoint remove NAME` stops syncing one. It never deletes files, here or in SharePoint.
+   - Or by hand: `looper-sharepoint libraries` lists the sites and libraries you can access, as ready-to-paste
+     `[[library]]` blocks.
 5. **Check:** `looper-sharepoint config check` validates the file and resolves every library in SharePoint.
 6. **Preview, then sync:**
    - `looper-sharepoint sync --dry-run` shows what would happen and changes nothing.
@@ -196,6 +205,9 @@ looper-sharepoint trigger --reconnect  # reconnect live updates now
 
 With no host running, `sync` runs a one-off sync in its own process, and `status` shows what the local state
 remembers.
+
+A host started from a config file reads it again when `add` or `remove` changes it: runs in progress finish, then
+every library is set up from the new file. A file with a mistake is refused, and the host keeps the config it had.
 
 ## 5. Live updates
 

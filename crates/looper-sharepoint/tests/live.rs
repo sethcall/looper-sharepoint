@@ -475,3 +475,164 @@ async fn folder_as_library_root() {
 
     h.cleanup().await;
 }
+
+impl Harness {
+    /// Run `looper-sharepoint --json ARGS`; returns (exit code, stdout as JSON or a string, stderr).
+    fn cli(&self, args: &[&str]) -> (i32, Value, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_looper-sharepoint"))
+            .arg("--json")
+            .args(args)
+            .env("LOOPER_SHAREPOINT_CONFIG", self.dir.path().join("config.toml"))
+            .env("LOOPER_SHAREPOINT_DATA_DIR", self.dir.path().join("data"))
+            .env("LOOPER_SHAREPOINT_TEST_USERNAME", &self.vars["QA_USER_1"])
+            .env("LOOPER_SHAREPOINT_TEST_PASSWORD", &self.vars["QA_USER_1_PASSWORD"])
+            .env("RUST_LOG", "error")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // `add` prints its own line, then the first sync's report; other commands one (pretty) document.
+        let v = serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| stdout.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).fold(json!({}), |mut acc, v| {
+            if let (Some(a), Some(o)) = (acc.as_object_mut(), v.as_object()) {
+                a.extend(o.clone());
+            }
+            acc
+        }));
+        (out.status.code().unwrap_or(-1), v, String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    fn config_text(&self) -> String {
+        read(&self.dir.path().join("config.toml"))
+    }
+
+    /// The browser's address for a folder (or library) in the QA library.
+    fn web(&self, rel: &str) -> String {
+        let site = self.vars["QA_SITE_URL"].trim_end_matches('/');
+        let enc = |s: &str| s.split('/').map(|seg| seg.replace(' ', "%20")).collect::<Vec<_>>().join("/");
+        format!("{site}/Shared%20Documents/{}", enc(rel))
+    }
+}
+
+use serde_json::json;
+
+/// `add` from each kind of link, `remove`, and the checks in between: `specs/onboarding-design.md` §5.
+#[tokio::test]
+async fn add_and_remove_from_links() {
+    let h = Harness::configured(|_, dir, _| (format!("[sync]\nroot = \"{}\"\n", dir.join("root").display()), dir.join("unused")));
+    let p = h.prefix.clone();
+    h.put("plain/a.txt", "a").await;
+    h.put("browser/b.txt", "b").await;
+    h.put("shared/Deep Folder/c.txt", "c").await;
+
+    // A site link (the whole library): resolved to the site's main library. Not synced here (--no-sync).
+    let (code, v, err) = h.cli(&["add", &h.vars["QA_SITE_URL"], "--to", h.dir.path().join("work/all").to_str().unwrap(), "--no-sync"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!((v["library"].as_str(), v["folder"].as_str()), (Some("Documents"), None), "{v}");
+    // A folder in it would overlap: refused.
+    let (code, _, err) = h.cli(&["add", &h.web(&format!("{p}/plain")), "--to", h.dir.path().join("work/x").to_str().unwrap()]);
+    assert!(code != 0 && err.contains("same SharePoint folder"), "{err}");
+    let (code, _, err) = h.cli(&["remove", "all"]);
+    assert_eq!(code, 0, "{err}");
+
+    // A plain folder link, into a folder of our choosing.
+    let to = h.dir.path().join("work/plain");
+    let (code, v, err) = h.cli(&["add", &h.web(&format!("{p}/plain")), "--to", to.to_str().unwrap()]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!((v["added"].as_bool(), v["name"].as_str(), v["folder"].as_str()), (Some(true), Some("plain"), Some(&*format!("{p}/plain"))), "{v}");
+    assert_eq!(read(&to.join("a.txt")), "a", "first sync done by add: {v} {err}");
+
+    // The browser's AllItems page for a folder; the suggested folder (no --to) under sync.root.
+    let site_path = url::Url::parse(&h.vars["QA_SITE_URL"]).unwrap().path().trim_end_matches('/').to_string();
+    let id = format!("{site_path}/Shared Documents/{p}/browser");
+    let q: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+    let all_items = format!("{}/Shared%20Documents/Forms/AllItems.aspx?id={}&viewid=00000000-0000-0000-0000-000000000000", h.vars["QA_SITE_URL"].trim_end_matches('/'), q.replace('+', "%20"));
+    let (code, v, err) = h.cli(&["add", &all_items, "--yes"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(read(&h.dir.path().join("root/browser/b.txt")), "b", "{v} {err}");
+
+    // A sharing link to a folder with a space in its name.
+    let deep = h.id("shared/Deep Folder").await;
+    let resp = h.graph.send(reqwest::Method::POST, &format!("/drives/{}/items/{deep}/createLink", h.drive), |r| {
+        r.header("Content-Type", "application/json").body(r#"{"type":"view","scope":"organization"}"#)
+    }).await.unwrap();
+    let link: Value = resp.json().await.unwrap();
+    let link = link["link"]["webUrl"].as_str().unwrap().to_string();
+    let deep_to = h.dir.path().join("work/deep");
+    let (code, v, err) = h.cli(&["add", &link, "--to", deep_to.to_str().unwrap(), "--read-only"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(v["name"], "deep", "{v}");
+    assert_eq!(read(&deep_to.join("c.txt")), "c", "{v} {err}");
+    assert!(h.config_text().contains("read_only = true"));
+
+    // The same folder again: reported, nothing added.
+    let (code, v, _) = h.cli(&["add", &h.web(&format!("{p}/plain")), "--to", h.dir.path().join("work/other").to_str().unwrap()]);
+    assert_eq!((code, v["added"].as_bool(), v["already"].as_str()), (0, Some(false), Some("plain")), "{v}");
+
+    // Overlapping: inside another library's folder.
+    let (code, _, err) = h.cli(&["add", &h.web(&format!("{p}/shared")), "--to", to.join("inner").to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(err.contains("inside"), "{err}");
+    // A file link is refused; so is a non-empty folder, unless --adopt.
+    let (code, _, err) = h.cli(&["add", &h.web(&format!("{p}/plain/a.txt")), "--to", h.dir.path().join("work/file").to_str().unwrap()]);
+    assert!(code != 0 && err.contains("file"), "{err}");
+    let busy = h.dir.path().join("work/busy");
+    write(&busy.join("mine.txt"), "mine");
+    let (code, _, err) = h.cli(&["add", &h.web(&format!("{p}/shared")), "--to", busy.to_str().unwrap()]);
+    assert!(code != 0 && err.contains("isn't empty"), "{err}");
+    let (code, v, err) = h.cli(&["add", &h.web(&format!("{p}/shared")), "--to", busy.to_str().unwrap(), "--adopt", "--name", "busy"]);
+    assert_ne!(code, 0, "the read-only `deep` library overlaps `busy` in SharePoint: refused: {v} {err}");
+    assert!(err.contains("same SharePoint folder"), "{err}");
+    let (code, _, err) = h.cli(&["remove", "deep"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, v, err) = h.cli(&["add", &h.web(&format!("{p}/shared")), "--to", busy.to_str().unwrap(), "--adopt", "--name", "busy"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(h.remote_text("shared/mine.txt").await, "mine", "--adopt uploads files only here");
+    assert_eq!(read(&busy.join("Deep Folder/c.txt")), "c");
+
+    // remove: the files stay, the config no longer has it, and adding it again starts fresh.
+    let (code, v, err) = h.cli(&["remove", "plain"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(v["state_forgotten"], true, "{v}");
+    assert_eq!(read(&to.join("a.txt")), "a");
+    assert!(h.exists("plain/a.txt").await);
+    assert!(!h.config_text().contains("/plain\""), "{}", h.config_text());
+
+    h.cleanup().await;
+}
+
+/// A running host picks up `add` (and `remove`) at once, and does the first sync itself.
+#[tokio::test]
+async fn running_host_reloads_after_add() {
+    let h = Harness::configured(|_, dir, _| (format!("[sync]\nroot = \"{}\"\npush = false\n", dir.join("root").display()), dir.join("unused")));
+    h.put("live/a.txt", "a").await;
+    let mut host = Command::new(env!("CARGO_BIN_EXE_looper-sharepoint"))
+        .args(["run", "--no-tui"])
+        .env("LOOPER_SHAREPOINT_CONFIG", h.dir.path().join("config.toml"))
+        .env("LOOPER_SHAREPOINT_DATA_DIR", h.dir.path().join("data"))
+        .env("LOOPER_SHAREPOINT_TEST_USERNAME", &h.vars["QA_USER_1"])
+        .env("LOOPER_SHAREPOINT_TEST_PASSWORD", &h.vars["QA_USER_1_PASSWORD"])
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait for its control socket.
+    for _ in 0..50 {
+        if h.cli(&["status"]).1["live"] == true {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let to = h.dir.path().join("work/live");
+    let (code, v, err) = h.cli(&["add", &h.web(&format!("{}/live", h.prefix)), "--to", to.to_str().unwrap()]);
+    let (_, status, _) = h.cli(&["status"]);
+    let (rm, _, rm_err) = h.cli(&["remove", "live"]);
+    let (_, after, _) = h.cli(&["status"]);
+    let _ = host.kill();
+    let _ = host.wait();
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(read(&to.join("a.txt")), "a");
+    assert_eq!((status["live"].as_bool(), status["status"]["libraries"][0]["name"].as_str()), (Some(true), Some("live")), "{status}");
+    assert_eq!(rm, 0, "{rm_err}");
+    assert_eq!(after["status"]["libraries"].as_array().map(Vec::len), Some(0), "{after}");
+    h.cleanup().await;
+}
