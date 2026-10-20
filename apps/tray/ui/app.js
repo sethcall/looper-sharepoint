@@ -91,7 +91,8 @@ function render() {
   $("config-path").textContent = snap.config_path;
   $("stats").textContent = st ? `${st.requests} requests (${st.throttled_responses} throttled) · checks every ${short(st.poll_interval_secs)} while polling, ${short(st.push_safety_interval_secs)} while live · running ${short((Date.now() - Date.parse(st.started_at)) / 1000)}` : "";
   renderMode(st);
-  $("sync-all").disabled = !st;
+  $("sync-all").disabled = !st || st.libraries.length === 0;
+  $("add").hidden = !(st && snap.set_up);
   $("pause").disabled = !st;
   $("pause").textContent = st && st.paused ? "Resume" : "Pause";
 
@@ -99,9 +100,16 @@ function render() {
   const banner = $("banner");
   let html = "";
   let bad = false;
-  if (!st && snap.error) {
+  if (!snap.set_up) {
+    html = `Not set up yet. Open the setup file or link you were sent, or <button data-act="setup">Set up…</button>`;
+  } else if (!st && snap.error) {
     html = `${esc(firstLine(snap.error))} <button class="secondary" data-act="config">Open config file</button>`;
     bad = true;
+  } else if (snap.config_problem) {
+    html = `The config file was changed but has a problem, so the previous settings are still in use: ${esc(firstLine(snap.config_problem))} <button class="secondary" data-act="config">Open config file</button>`;
+    bad = true;
+  } else if (st && st.libraries.length === 0) {
+    html = `Nothing to sync yet. <button data-act="add">Add a SharePoint folder…</button>`;
   } else if (st && st.libraries.some((l) => l.state === "sign_in_required")) {
     html = `Your sign-in expired or was revoked. <button data-act="signin">Sign in…</button>`;
     bad = true;
@@ -116,6 +124,9 @@ function render() {
   banner.hidden = !html;
   banner.className = `banner${bad ? " bad" : ""}`;
   banner.innerHTML = html;
+  const notice = $("notice");
+  notice.hidden = !snap.notice;
+  notice.innerHTML = snap.notice ? `${esc(snap.notice)} <button class="secondary" data-act="dismiss">OK</button>` : "";
 
   // Libraries.
   $("libraries").innerHTML = (st?.libraries ?? []).map((l) => {
@@ -126,6 +137,7 @@ function render() {
       <div class="lib-top">
         <div><span class="lib-name">${esc(l.name)}</span><span class="badge ${cls}">${esc(label)}</span></div>
         <div class="actions">
+          <button class="secondary" data-act="remove" data-lib="${esc(l.name)}">Stop syncing…</button>
           <button class="secondary" data-act="open" data-lib="${esc(l.name)}">Open folder</button>
           <button data-act="sync" data-lib="${esc(l.name)}">Sync</button>
         </div>
@@ -182,6 +194,10 @@ async function act(what, lib) {
     if (what === "allow-deletions") await invoke("allow_deletions", { library: lib ?? null });
     if (what === "reconnect") await invoke("reconnect", { library: lib ?? null });
     if (what === "pause") await invoke("set_paused", { paused: !snap?.status?.paused });
+    if (what === "setup") return obSetup();
+    if (what === "add") return obAdd();
+    if (what === "remove") return obRemove(lib);
+    if (what === "dismiss") await invoke("dismiss_notice");
   } catch (e) {
     alertBanner(String(e));
   }
@@ -202,6 +218,7 @@ document.addEventListener("click", (e) => {
 $("sync-all").addEventListener("click", () => act("sync"));
 $("pause").addEventListener("click", () => act("pause"));
 $("config").addEventListener("click", () => act("config"));
+$("add").addEventListener("click", () => act("add"));
 
 // ---- the command line tool dialog (specs/install-cli-design.md §4.1, §6) ----
 
@@ -341,13 +358,245 @@ document.addEventListener("click", (e) => {
   if (el) { e.preventDefault(); cliAct(el.dataset.cli); }
 });
 listen("show-cli", (e) => showCli(e.payload));
-if (location.hash.startsWith("#cli-")) {
+listen("show-onboard", (e) => showOnboard(e.payload));
+listen("signed-in", () => {
+  if (ob.view === "setup-done") $("ob-msg").hidden = true;
+  refresh();
+});
+if (location.hash === "#onboard") {
+  history.replaceState(null, "", location.pathname);
+  showOnboard(null);
+  refreshCli();
+} else if (location.hash.startsWith("#cli-")) {
   const kind = location.hash.slice(5);
   history.replaceState(null, "", location.pathname);
   showCli(kind);
 } else {
   refreshCli();
 }
+
+// ---- setting up and adding (specs/onboarding-design.md §4, §5) ----
+
+let ob = {};
+
+function obDialog({ title, body, actions, msg, bad, view }) {
+  ob.view = view ?? null;
+  $("ob-title").textContent = title;
+  $("ob-body").innerHTML = body ?? "";
+  const m = $("ob-msg");
+  m.hidden = !msg;
+  m.className = `cli-msg${bad ? " bad" : ""}`;
+  m.innerHTML = msg ?? "";
+  $("ob-actions").innerHTML = actions.map(([id, label, secondary]) => `<button type="button" data-ob="${id}"${secondary ? ' class="secondary"' : ""}>${esc(label)}</button>`).join("");
+  const d = $("ob-dialog");
+  if (!d.open) d.showModal();
+}
+
+function obClose() {
+  $("ob-dialog").close();
+  ob = {};
+  refresh();
+}
+
+// From the menu ({kind: "setup" | "add"}), something opened from outside ({kind, source | link}), or a new window
+// (null: whatever's waiting, else the obvious next step).
+async function showOnboard(p) {
+  if (!p || (!p.source && !p.link)) {
+    const pending = await invoke("take_pending").catch(() => null);
+    if (pending) p = pending;
+  }
+  if (!snap) await refresh();
+  const kind = p?.kind ?? (snap?.set_up ? "add" : "setup");
+  if (kind === "setup") return p?.source ? obSetupPreview(p.source) : obSetup();
+  return obAdd(p?.link);
+}
+
+function obSetup() {
+  obDialog({
+    title: "Set up Looper SharePoint",
+    body: `<p>Paste the setup link you were sent (it starts with <code>looper-sharepoint://setup</code>), or choose the setup file (<code>….looper-sharepoint</code>).</p>
+      <div class="row"><input type="text" id="ob-source" placeholder="looper-sharepoint://setup?…" autofocus><button type="button" class="secondary" data-ob="choose-file">Choose file…</button></div>`,
+    actions: [["cancel", "Cancel", true], ["setup-next", "Continue"]],
+  });
+}
+
+async function obSetupPreview(source) {
+  ob.source = source;
+  try {
+    const p = await invoke("setup_preview", { source });
+    ob.plan = p;
+    const libs = p.libraries.map((l) => `<li>${esc(l.site)} · ${esc(l.library)}${l.folder ? ` · ${esc(l.folder)}` : ""} → <code>${esc(l.path)}</code></li>`).join("");
+    obDialog({
+      title: "Set up Looper SharePoint",
+      body: `<p>This sets up Looper SharePoint for:</p>
+        <dl class="plan">
+          <dt>Organization</dt><dd><code>${esc(p.account.tenant)}</code></dd>
+          <dt>App</dt><dd>${esc(p.account.app_name ?? "looper-sharepoint")} (<code>${esc(p.account.client_id)}</code>)</dd>
+          ${libs ? `<dt>Adds</dt><dd><ul>${libs}</ul></dd>` : ""}
+        </dl>
+        ${p.replaces ? `<label><input type="checkbox" id="ob-replace"> Switch this computer from the organization it's set up for now (<code>${esc(p.replaces.tenant)}</code>). Your libraries stay, and you sign in again.</label>` : ""}
+        <p class="muted">Then you sign in with your work account in the browser.</p>`,
+      actions: [["cancel", "Cancel", true], ["setup-apply", "Set up"]],
+    });
+  } catch (e) {
+    obDialog({ title: "Set up Looper SharePoint", msg: esc(String(e)), bad: true, actions: [["cancel", "Close", true], ["setup-start", "Try another"]] });
+  }
+}
+
+async function obSetupApply() {
+  if (ob.plan?.replaces && !$("ob-replace")?.checked) {
+    const m = $("ob-msg");
+    m.hidden = false;
+    m.className = "cli-msg bad";
+    m.textContent = "Tick the box to switch organizations, or cancel.";
+    return;
+  }
+  try {
+    const r = await invoke("setup_apply", { source: ob.source, replace: !!$("ob-replace")?.checked });
+    const skipped = r.skipped.map((s) => `<li>${esc(s)}</li>`).join("");
+    obDialog({
+      view: "setup-done",
+      title: "Set up",
+      body: `<p>Looper SharePoint is set up${r.added.length ? `, syncing ${r.added.map(esc).join(", ")}` : ""}.</p>${skipped ? `<p>Not added:</p><ul>${skipped}</ul>` : ""}`,
+      msg: r.signed_in ? null : "Sign in with your work account in the browser window that opened.",
+      actions: r.added.length ? [["cancel", "Done"]] : [["cancel", "Later", true], ["add-start", "Add a SharePoint folder…"]],
+    });
+  } catch (e) {
+    obDialog({ title: "Set up Looper SharePoint", msg: esc(String(e)), bad: true, actions: [["cancel", "Close"]] });
+  }
+}
+
+function obAdd(link) {
+  obDialog({
+    title: "Add a SharePoint folder",
+    body: `<p>In SharePoint, open the site, library or folder you want, copy the address from the browser's address bar, and paste it here. A sharing link to a folder works too.</p>
+      <input type="text" id="ob-link" placeholder="https://contoso.sharepoint.com/sites/…" value="${esc(link ?? "")}" autofocus>`,
+    actions: [["cancel", "Cancel", true], ["add-next", "Continue"]],
+  });
+  if (link) obAddPreview(link, null);
+}
+
+async function obAddPreview(link, library) {
+  ob.link = link;
+  ob.library = library;
+  obDialog({ title: "Add a SharePoint folder", msg: "Looking it up in SharePoint…", actions: [["cancel", "Cancel", true]] });
+  try {
+    const p = await invoke("add_preview", { link, library });
+    ob.addPlan = p;
+    if (p.already) {
+      const [name, path] = p.already;
+      ob.openLib = name;
+      return obDialog({ title: "Already syncing", body: `<p>${esc(p.describe)} already syncs to <code>${esc(path)}</code>.</p>`, actions: [["cancel", "Close", true], ["open-lib", "Open folder"]] });
+    }
+    const libs = p.other_libraries.length
+      ? `<dt>Library</dt><dd><select id="ob-lib">${[p.library, ...p.other_libraries].map((n) => `<option${n === p.library ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></dd>`
+      : "";
+    obDialog({
+      title: "Add a SharePoint folder",
+      body: `<dl class="plan"><dt>Syncs</dt><dd>${esc(p.describe)}</dd>${libs}</dl>
+        <label>Local folder</label>
+        <div class="row"><input type="text" id="ob-to" value="${esc(p.suggested)}"><button type="button" class="secondary" data-ob="choose-folder">Choose…</button></div>
+        <p class="muted">${p.folder ? "The SharePoint folder's contents" : "The library's contents"} go straight into this folder. Choose a new or empty one.</p>
+        <label><input type="checkbox" id="ob-ro"> Only download: never upload my changes</label>
+        <label id="ob-adopt-row" hidden><input type="checkbox" id="ob-adopt"> Use it anyway: keep its files (files that are only here are uploaded)</label>`,
+      actions: [["cancel", "Cancel", true], ["add-apply", "Add"]],
+    });
+  } catch (e) {
+    const signIn = String(e).includes("sign in");
+    obDialog({
+      title: "Add a SharePoint folder",
+      msg: esc(String(e)),
+      bad: true,
+      actions: signIn ? [["cancel", "Close", true], ["signin", "Sign in…"]] : [["cancel", "Close", true], ["add-start", "Try another link"]],
+    });
+  }
+}
+
+async function obAddApply() {
+  const to = $("ob-to").value.trim();
+  try {
+    const r = await invoke("add_apply", { link: ob.link, library: ob.library, to, readOnly: $("ob-ro").checked, adopt: $("ob-adopt").checked });
+    ob.openLib = r.name;
+    obDialog({
+      title: "Added",
+      body: `<p>Syncing ${esc(ob.addPlan.describe)} into <code>${esc(r.path)}</code>. The first sync has started; from now on your changes upload within seconds and SharePoint's arrive within about 30 seconds.</p>`,
+      actions: [["cancel", "Done", true], ["open-lib", "Open folder"]],
+    });
+  } catch (e) {
+    const m = $("ob-msg");
+    m.hidden = false;
+    m.className = "cli-msg bad";
+    m.textContent = String(e);
+    if (String(e).includes("isn't empty")) $("ob-adopt-row").hidden = false;
+  }
+}
+
+function obRemove(lib) {
+  const l = snap?.status?.libraries.find((x) => x.name === lib);
+  ob.removeLib = lib;
+  obDialog({
+    title: "Stop syncing",
+    body: `<p>Stop syncing <b>${esc(lib)}</b>? Nothing is deleted: the files stay in <code>${esc(l?.local_path ?? "")}</code> and in SharePoint. You can add it again later.</p>`,
+    actions: [["cancel", "Cancel", true], ["remove-apply", "Stop syncing"]],
+  });
+}
+
+async function obAct(what) {
+  try {
+    if (what === "cancel") return obClose();
+    if (what === "setup-start") return obSetup();
+    if (what === "choose-file") {
+      const f = await invoke("choose_setup_file");
+      if (f) return obSetupPreview(f);
+      return;
+    }
+    if (what === "setup-next") {
+      const v = $("ob-source").value.trim();
+      if (v) return obSetupPreview(v);
+      return;
+    }
+    if (what === "setup-apply") return obSetupApply();
+    if (what === "add-start") return obAdd();
+    if (what === "add-next") {
+      const v = $("ob-link").value.trim();
+      if (v) return obAddPreview(v, null);
+      return;
+    }
+    if (what === "choose-folder") {
+      const f = await invoke("choose_folder", { start: $("ob-to").value });
+      if (f) $("ob-to").value = f;
+      return;
+    }
+    if (what === "add-apply") return obAddApply();
+    if (what === "open-lib") {
+      await invoke("open_folder", { library: ob.openLib });
+      return obClose();
+    }
+    if (what === "signin") {
+      await invoke("sign_in");
+      return obDialog({ title: "Sign in", msg: "Sign in with your work account in the browser window that opened, then try again.", actions: [["cancel", "Close", true], ["add-start", "Try again"]] });
+    }
+    if (what === "remove-apply") {
+      const path = await invoke("remove_library", { name: ob.removeLib });
+      return obDialog({ title: "Stopped syncing", body: `<p>Nothing was deleted. The files are still in <code>${esc(path)}</code>.</p>`, actions: [["cancel", "Done"]] });
+    }
+  } catch (e) {
+    obDialog({ title: $("ob-title").textContent, msg: esc(String(e)), bad: true, actions: [["cancel", "Close"]] });
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-ob]");
+  if (el) { e.preventDefault(); obAct(el.dataset.ob); }
+});
+document.addEventListener("change", (e) => {
+  if (e.target.id === "ob-lib") obAddPreview(ob.link, e.target.value);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || !$("ob-dialog").open) return;
+  if (e.target.id === "ob-source") { e.preventDefault(); obAct("setup-next"); }
+  if (e.target.id === "ob-link") { e.preventDefault(); obAct("add-next"); }
+});
 
 listen("status-changed", refresh);
 setInterval(render, 1000);

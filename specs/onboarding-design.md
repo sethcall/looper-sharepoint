@@ -8,10 +8,10 @@ library, a SharePoint folder synced directly into it).
 | Probe: `/shares` for plain links | Done: it resolves folder and library URLs, `AllItems.aspx?id=` pages, file URLs and sharing links to the item. A site URL gives 400 for `driveItem`, but `/shares/{url}/site` works |
 | §3 a folder per library, a folder as the root | Built; live test `folder_as_library_root` |
 | §5, §6 `add`, `remove`, reload (CLI and `run`) | Built; live tests `add_and_remove_from_links`, `running_host_reloads_after_add` |
-| §5, §6 in the tray: Add window, reload, saved config file | Next |
+| §5, §6 in the tray: Set Up and Add windows, Stop syncing, reload when the config file is saved | Built; checked with a dev tray (no config → setup → add → one reload → synced). Clicking through the windows: manual |
 | §4 setup file and link (CLI: `setup`, `setup export`) | Built; offline test `setup_from_link_and_file_and_export`, tried end to end against QA |
-| §7 `looper-sharepoint://` and `.looper-sharepoint` opened in the app | With the tray work |
-| §8 start at login | |
+| §7 `looper-sharepoint://` and `.looper-sharepoint` opened in the app | Built (Info.plist, `RunEvent::Opened`). Manual: needs the packaged app in Applications |
+| §8 start at login | Built: tray menu item, on after the first sync, `start-at-login on\|off\|status`. Manual: needs the packaged app |
 | §9, §10 help, quickstart, README | |
 
 ## 1. Goal

@@ -103,6 +103,12 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Keep syncing after restarts: start the menu-bar app (or, with only this tool, `run`) at login
+    #[cfg(unix)]
+    StartAtLogin {
+        #[arg(value_enum, default_value_t = LoginWhat::Status)]
+        what: LoginWhat,
+    },
     /// Stop syncing a library. Never deletes files, here or in SharePoint
     Remove {
         /// The library's name (as `status` shows it)
@@ -190,6 +196,13 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LoginWhat {
+    On,
+    Off,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -424,6 +437,8 @@ async fn run(cli: Cli, tui: bool, log_file: &Path) -> Result<ExitCode> {
             return onboard::add(&config_path, &data, args, cli.json).await;
         }
         Cmd::Remove { name } => return onboard::remove(&config_path, &data, &name, cli.json).await,
+        #[cfg(unix)]
+        Cmd::StartAtLogin { what } => return onboard::start_at_login(&config_path, &data, what, cli.json),
         Cmd::Libraries { site } => {
             let cfg = load()?;
             libraries(&graph(&cfg)?, site.as_deref(), cli.json).await?;

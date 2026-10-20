@@ -5,5 +5,58 @@
   <!-- Menu-bar app: no Dock icon (the status window switches to a regular app while it's open). -->
   <key>LSUIElement</key>
   <true/>
+
+  <!-- looper-sharepoint://setup?… and looper-sharepoint://add?… links (specs/onboarding-design.md §7). macOS registers
+       them once the app is in Applications and has been opened. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>dev.looper-sharepoint.link</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>looper-sharepoint</string>
+      </array>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+    </dict>
+  </array>
+
+  <!-- Setup files: <name>.looper-sharepoint. -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>dev.looper-sharepoint.setup</string>
+      <key>UTTypeDescription</key>
+      <string>Looper SharePoint setup</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.plain-text</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>looper-sharepoint</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Looper SharePoint setup</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>dev.looper-sharepoint.setup</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>

@@ -145,3 +145,13 @@ dialog pre { background: var(--panel); padding: 8px 10px; border-radius: 6px; wh
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
 .cli-msg { padding: 8px 10px; border-radius: 6px; background: var(--panel); }
 .cli-msg.bad { color: var(--bad); }
+
+dialog input[type="text"] { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+dialog .row { display: flex; gap: 8px; align-items: center; }
+dialog .row input[type="text"] { flex: 1; }
+dialog dl.plan { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0; }
+dialog dl.plan dt { color: var(--muted); }
+dialog dl.plan dd { margin: 0; word-break: break-all; }
+#ob-dialog { width: min(560px, 90vw); }
+.notice { margin: 12px 20px 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); }
+.notice button { margin-left: 8px; }

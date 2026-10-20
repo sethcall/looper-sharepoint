@@ -1,40 +1,94 @@
 //! `looper-sharepoint-tray`: a menu-bar (macOS) / notification-area (Windows) host for the sync service.
 //!
 //! Like `looper-sharepoint run`, this is only a host: it embeds `looper-sharepoint-engine` through its public API,
-//! renders `Status`, and forwards user actions. No windows exist until the user opens one from the tray.
-//! See `specs/m2-design.md` §7.
+//! renders `Status`, and forwards user actions. No windows exist until the user opens one from the tray (or opens a
+//! setup file or `looper-sharepoint://` link). See `specs/m2-design.md` §7 and `specs/onboarding-design.md`.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde::Serialize;
 use looper_sharepoint_engine::account::{self, SignInPrompt};
 use looper_sharepoint_engine::core::config::{AuthFlow, Config, data_dir};
-use looper_sharepoint_engine::{Event, Health, LibraryState, Mode, PushState, RunOptions, RunRecord, Service, ServiceConfig, Status, Trigger};
+use looper_sharepoint_engine::graph::GraphClient;
+use looper_sharepoint_engine::links::{self, AppLink};
+use looper_sharepoint_engine::onboard::{self, AddOptions, AddPlan, SetupDone, SetupPlan};
+use looper_sharepoint_engine::{Event, Health, LibraryState, Mode, Outcome, PushState, RunOptions, RunRecord, Service, ServiceConfig, Status, Trigger};
 use tauri::image::Image;
+#[cfg(target_os = "macos")]
+use tauri::menu::CheckMenuItemBuilder;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 const TRAY_ID: &str = "main";
 const STATUS_WINDOW: &str = "status";
 /// Menus show relative times; refresh them at least this often.
 const MENU_REFRESH: Duration = Duration::from_secs(30);
+/// A saved config file is read again once it's been quiet this long.
+const CONFIG_QUIET: Duration = Duration::from_millis(800);
 
 struct AppState {
     config_path: PathBuf,
     data_dir: PathBuf,
+    rt: RwLock<Running>,
+    signing_in: Mutex<bool>,
+    /// A setup or add link, or a setup file, opened from outside: for the status window to show.
+    pending: Mutex<Option<Pending>>,
+    /// The config file was changed and couldn't be loaded: the service keeps its previous config.
+    config_problem: Mutex<Option<String>>,
+    /// A one-line notice for the status window (e.g. "now starts at login").
+    notice: Mutex<Option<String>>,
+    /// The last `add_preview`, so `add_apply` doesn't look the link up again.
+    last_add: Mutex<Option<(String, AddPlan)>>,
+}
+
+/// What runs for the current config. Replaced as a whole when the config file appears or switches organization.
+#[derive(Default)]
+struct Running {
     config: Option<Config>,
     svc: Option<Service>,
-    /// Why there is no service (bad config, another host running, ...).
+    /// Why there is no service (not set up, bad config, another host running, ...).
     error: Option<String>,
     _ipc: Option<looper_sharepoint_ipc::Server>,
-    signing_in: Mutex<bool>,
+    /// Bumped on every restart, so the old event loop stops.
+    generation: u64,
+}
+
+impl AppState {
+    fn svc(&self) -> Option<Service> {
+        self.rt.read().unwrap().svc.clone()
+    }
+
+    /// The config in use: the service's (it follows reloads), else the one loaded without a service.
+    fn config(&self) -> Option<Config> {
+        let rt = self.rt.read().unwrap();
+        rt.svc.as_ref().map(Service::config).or_else(|| rt.config.clone())
+    }
+
+    fn error(&self) -> Option<String> {
+        self.rt.read().unwrap().error.clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.rt.read().unwrap().generation
+    }
+}
+
+/// Opened from outside, waiting for the status window.
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Pending {
+    /// A setup file's path, or a `looper-sharepoint://setup` link.
+    Setup { source: String },
+    /// A SharePoint link (or a `looper-sharepoint://add` link) to add.
+    Add { link: String },
 }
 
 /// What the status window renders.
@@ -48,6 +102,10 @@ struct Snapshot {
     /// Live or polling, for the status window's mode pill.
     mode: Option<Mode>,
     mode_text: Option<String>,
+    /// There's a config with an organization in it.
+    set_up: bool,
+    config_problem: Option<String>,
+    notice: Option<String>,
 }
 
 fn main() {
@@ -59,15 +117,29 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_status, sync_now, set_paused, reconnect, allow_deletions, open_folder, open_config, sign_in, cli_info, cli_install, cli_add_to_path, cli_remove, cli_repair])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            get_status, sync_now, set_paused, reconnect, allow_deletions, open_folder, open_config, sign_in, take_pending,
+            setup_preview, setup_apply, choose_setup_file, add_preview, add_apply, choose_folder, remove_library,
+            login_item_info, set_login_item, dismiss_notice, cli_info, cli_install, cli_add_to_path, cli_remove, cli_repair
+        ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             #[cfg(unix)]
             cli::repair_at_launch(&data);
-            let state = tauri::async_runtime::block_on(start(config_path.clone(), data.clone()));
-            let initial = state.svc.as_ref().map(|s| s.status());
-            app.manage(state);
+            let running = tauri::async_runtime::block_on(start(config_path.clone(), data.clone()));
+            let initial = running.svc.as_ref().map(|s| s.status());
+            app.manage(AppState {
+                config_path: config_path.clone(),
+                data_dir: data.clone(),
+                rt: RwLock::new(running),
+                signing_in: Mutex::new(false),
+                pending: Mutex::new(None),
+                config_problem: Mutex::new(None),
+                notice: Mutex::new(None),
+                last_add: Mutex::new(None),
+            });
             let menu = build_menu(app.handle(), initial.as_ref())?;
             let icon = initial.as_ref().map(icon_key).unwrap_or((Health::Attention, false));
             TrayIconBuilder::with_id(TRAY_ID)
@@ -78,7 +150,8 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, ev| on_menu(app, ev.id().as_ref()))
                 .build(app)?;
-            tauri::async_runtime::spawn(forward_events(app.handle().clone()));
+            tauri::async_runtime::spawn(forward_events(app.handle().clone(), 0));
+            watch_config(app.handle().clone());
             if open_status && let Err(e) = show_status_window(app.handle()) {
                 tracing::warn!("opening status window: {e}");
             }
@@ -87,11 +160,17 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("starting the tray app");
 
-    app.run(|_, event| {
+    app.run(|app, event| match event {
         // Closing the last window must not quit a tray app; only "Quit" (which passes an exit code) does.
-        if let RunEvent::ExitRequested { api, code: None, .. } = event {
-            api.prevent_exit();
+        RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+        // A setup file opened in Finder, or a looper-sharepoint:// link clicked anywhere.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RunEvent::Opened { urls } => {
+            for u in urls {
+                opened(app, u.as_str());
+            }
         }
+        _ => {}
     });
 }
 
@@ -107,63 +186,143 @@ fn init_logging(data: &Path) {
 }
 
 /// Load config and start the service. Failures become an error state shown in the tray, not a crash.
-async fn start(config_path: PathBuf, data: PathBuf) -> AppState {
-    let mut st = AppState {
-        config_path: config_path.clone(),
-        data_dir: data.clone(),
-        config: None,
-        svc: None,
-        error: None,
-        _ipc: None,
-        signing_in: Mutex::new(false),
-    };
+async fn start(config_path: PathBuf, data: PathBuf) -> Running {
+    let mut rt = Running::default();
     if !config_path.exists() {
-        st.error = Some("Not set up yet: choose Open Config File, fill in your organization's tenant and client_id, then restart.".into());
-        return st;
+        rt.error = Some("Not set up yet: open the setup file or link you were sent, or choose Set Up….".into());
+        return rt;
     }
     let config = match Config::load(&config_path) {
-        Ok(c) if c.libraries.is_empty() => {
-            st.error = Some("No libraries configured yet. Open the config file to add one.".into());
-            st.config = Some(c);
-            return st;
-        }
         Ok(c) => c,
         Err(e) => {
-            st.error = Some(format!("{e}"));
-            return st;
+            rt.error = Some(format!("{e}"));
+            return rt;
         }
     };
-    st.config = Some(config.clone());
-    let tokens: std::sync::Arc<dyn looper_sharepoint_engine::auth::TokenProvider> =
-        match (std::env::var("LOOPER_SHAREPOINT_TEST_USERNAME"), std::env::var("LOOPER_SHAREPOINT_TEST_PASSWORD")) {
-            // Test-only, as in the CLI: password sign-in for MFA-less QA accounts.
-            (Ok(user), Ok(pass)) => looper_sharepoint_engine::auth::PasswordProvider::new(account::authority(&config), user, pass),
-            _ => account::token_provider(&config, &data),
-        };
+    account::configure_client(&config);
+    rt.config = Some(config.clone());
+    let tokens = tokens(&config, &data);
     match Service::start(ServiceConfig { config, tokens, data_dir: data }) {
         Ok(svc) => {
             svc.set_config_file(&std::fs::canonicalize(&config_path).unwrap_or(config_path));
             match looper_sharepoint_ipc::serve(svc.clone()) {
-                Ok(server) => st._ipc = Some(server),
+                Ok(server) => rt._ipc = Some(server),
                 Err(e) => tracing::warn!("control socket unavailable: {e:#}"),
             }
-            st.svc = Some(svc);
+            rt.svc = Some(svc);
         }
-        Err(e) => st.error = Some(format!("{e:#}")),
+        Err(e) => rt.error = Some(format!("{e:#}")),
     }
-    st
+    rt
+}
+
+fn tokens(config: &Config, data: &Path) -> std::sync::Arc<dyn looper_sharepoint_engine::auth::TokenProvider> {
+    match (std::env::var("LOOPER_SHAREPOINT_TEST_USERNAME"), std::env::var("LOOPER_SHAREPOINT_TEST_PASSWORD")) {
+        // Test-only, as in the CLI: password sign-in for MFA-less QA accounts.
+        (Ok(user), Ok(pass)) => looper_sharepoint_engine::auth::PasswordProvider::new(account::authority(config), user, pass),
+        _ => account::token_provider(config, data),
+    }
+}
+
+/// Stop the current service (letting a run finish, briefly) and start again from the config file: after setup, or
+/// when the file appears or names another organization.
+async fn restart(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let old = {
+        let mut rt = st.rt.write().unwrap();
+        let next = rt.generation + 1;
+        let old = std::mem::take(&mut *rt);
+        rt.generation = next;
+        old
+    };
+    if let Some(svc) = &old.svc {
+        let _ = tokio::time::timeout(Duration::from_secs(15), svc.shutdown()).await;
+    }
+    // Releases the host lock and the control socket before the new service takes them.
+    drop(old);
+    let mut new = start(st.config_path.clone(), st.data_dir.clone()).await;
+    let generation = {
+        let mut rt = st.rt.write().unwrap();
+        new.generation = rt.generation;
+        *rt = new;
+        rt.generation
+    };
+    *st.config_problem.lock().unwrap() = None;
+    tauri::async_runtime::spawn(forward_events(app.clone(), generation));
+    refresh_menu(app);
+    let _ = app.emit("status-changed", ());
+}
+
+/// The config file was saved (by the user, `add`, `remove` or `setup`): reload it. The service skips a reload when
+/// the text didn't change, so a `reload` request from the CLI for the same change doesn't count twice.
+async fn config_changed(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let Some(svc) = st.svc() else {
+        restart(app).await;
+        return;
+    };
+    match svc.reload_file().await {
+        Ok(()) => *st.config_problem.lock().unwrap() = None,
+        Err(e) if format!("{e:#}").contains("different organization") => {
+            restart(app).await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("config not reloaded: {e:#}");
+            *st.config_problem.lock().unwrap() = Some(format!("{e:#}"));
+        }
+    }
+    refresh_menu(app);
+    let _ = app.emit("status-changed", ());
+}
+
+/// Watch the config file's folder; a change to the file (written in place or renamed over) reloads it.
+fn watch_config(app: AppHandle) {
+    use notify::Watcher;
+    let path = app.state::<AppState>().config_path.clone();
+    let Some(dir) = path.parent().map(Path::to_path_buf) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let name = path.file_name().map(|n| n.to_owned());
+    let mut watcher = match notify::recommended_watcher(move |ev: notify::Result<notify::Event>| {
+        if let Ok(ev) = ev
+            && ev.paths.iter().any(|p| p.file_name() == name.as_deref())
+        {
+            let _ = tx.send(());
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => return tracing::warn!("can't watch the config file: {e}"),
+    };
+    if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+        return tracing::warn!("can't watch {}: {e}", dir.display());
+    }
+    tauri::async_runtime::spawn(async move {
+        let _keep = watcher;
+        while rx.recv().await.is_some() {
+            // Wait until it's been quiet a moment (editors save in several steps).
+            while tokio::time::timeout(CONFIG_QUIET, rx.recv()).await.is_ok_and(|m| m.is_some()) {}
+            config_changed(&app).await;
+        }
+    });
 }
 
 /// Re-render the tray and notify the status window whenever the service reports a change (coalesced), and every
-/// [`MENU_REFRESH`] so relative times stay fresh.
-async fn forward_events(app: AppHandle) {
-    let Some(svc) = app.state::<AppState>().svc.clone() else { return };
-    let mut events = svc.subscribe();
+/// [`MENU_REFRESH`] so relative times stay fresh. Ends when the service is replaced (`generation` moves on).
+async fn forward_events(app: AppHandle, generation: u64) {
+    let Some(mut events) = app.state::<AppState>().svc().map(|s| s.subscribe()) else { return };
     let mut last_icon = None;
     let mut tick = tokio::time::interval(MENU_REFRESH);
     loop {
         let mut progress_only = tokio::select! {
-            ev = events.recv() => matches!(ev, Ok(Event::Progress { .. })),
+            ev = events.recv() => match ev {
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Ok(Event::RunFinished { record }) if record.outcome == Outcome::Ok => {
+                    first_sync_done(&app);
+                    false
+                }
+                ev => matches!(ev, Ok(Event::Progress { .. })),
+            },
             _ = tick.tick() => false,
         };
         // Coalesce bursts (a large sync emits an event per file), remembering whether anything but progress came in.
@@ -171,10 +330,14 @@ async fn forward_events(app: AppHandle) {
         while let Ok(ev) = events.try_recv() {
             progress_only &= matches!(ev, Event::Progress { .. });
         }
+        if app.state::<AppState>().generation() != generation {
+            return;
+        }
         let _ = app.emit("status-changed", ());
         if progress_only {
             continue;
         }
+        let Some(svc) = app.state::<AppState>().svc() else { return };
         let status = svc.status();
         if let Some(tray) = app.tray_by_id(TRAY_ID) {
             if let Ok(menu) = build_menu(&app, Some(&status)) {
@@ -188,6 +351,57 @@ async fn forward_events(app: AppHandle) {
                 last_icon = Some(icon);
             }
         }
+    }
+}
+
+/// After the first successful sync, start at login (once, unless the user turned it off): otherwise "it keeps
+/// itself in sync" stops at the next restart. `specs/onboarding-design.md` §8.
+fn first_sync_done(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        use looper_sharepoint_engine::login_item::{self, AppItem};
+        let st = app.state::<AppState>();
+        let mut prefs = login_item::load_prefs(&st.data_dir);
+        if prefs.auto_enabled_at.is_some() || prefs.user_turned_off || login_item::app_unavailable().is_some() {
+            return;
+        }
+        if login_item::app_status() == AppItem::Off {
+            match login_item::set_app(true) {
+                Ok(_) => {
+                    *st.notice.lock().unwrap() = Some(
+                        "Looper SharePoint now starts when you log in, so syncing carries on after a restart. Turn it off \
+                         with Start at Login in the menu, or in System Settings → General → Login Items."
+                            .into(),
+                    );
+                }
+                Err(e) => return tracing::warn!("couldn't turn on start at login: {e:#}"),
+            }
+        }
+        prefs.auto_enabled_at = Some(Utc::now().to_rfc3339());
+        let _ = login_item::save_prefs(&st.data_dir, &prefs);
+        refresh_menu(app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+/// A file or link opened from outside: show it in the status window, which asks before doing anything.
+fn opened(app: &AppHandle, url: &str) {
+    let pending = if let Ok(Some(link)) = links::parse_app_link(url) {
+        match link {
+            AppLink::Setup { .. } => Pending::Setup { source: url.to_string() },
+            AppLink::Add { .. } => Pending::Add { link: url.to_string() },
+        }
+    } else if let Some(path) = url::Url::parse(url).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok()) {
+        Pending::Setup { source: path.display().to_string() }
+    } else {
+        tracing::warn!(url, "opened with something this app doesn't handle");
+        return;
+    };
+    tracing::info!(url, "opened from outside");
+    *app.state::<AppState>().pending.lock().unwrap() = Some(pending.clone());
+    if show_status_window_at(app, "onboard").is_ok() {
+        let _ = app.emit("show-onboard", pending);
     }
 }
 
@@ -242,7 +456,7 @@ fn mode_menu_text(s: &Status) -> String {
 
 /// The product name from `account.app_name`, or the bundle's name when the config doesn't set one.
 fn app_name(st: &AppState) -> String {
-    match &st.config {
+    match st.config() {
         Some(c) if c.account.app_name != looper_sharepoint_engine::auth::net::DEFAULT_NAME => c.account.app_name.clone(),
         _ => "Looper SharePoint".into(),
     }
@@ -251,12 +465,12 @@ fn app_name(st: &AppState) -> String {
 fn tooltip(app: &AppHandle) -> String {
     let st = app.state::<AppState>();
     let name = app_name(&st);
-    match (&st.svc, &st.error) {
+    match (st.svc(), st.error()) {
         (Some(svc), _) => {
             let s = svc.status();
             format!("{name}: {}\n{}", s.headline(), s.mode().describe(s.poll_interval_secs))
         }
-        (None, Some(e)) => format!("{name}: {}", first_line(e)),
+        (None, Some(e)) => format!("{name}: {}", first_line(&e)),
         (None, None) => name,
     }
 }
@@ -266,8 +480,11 @@ fn build_menu(app: &AppHandle, status: Option<&Status>) -> tauri::Result<Menu<ta
     let mut m = MenuBuilder::new(app);
     match status {
         None => {
-            let msg = st.error.as_deref().map(first_line).unwrap_or("Not running");
-            m = m.item(&MenuItemBuilder::with_id("noop", truncate(msg, 70)).enabled(false).build(app)?);
+            let msg = st.error().unwrap_or_else(|| "Not running".into());
+            m = m.item(&MenuItemBuilder::with_id("noop", truncate(first_line(&msg), 70)).enabled(false).build(app)?);
+            if st.config().is_none() {
+                m = m.separator().item(&MenuItemBuilder::with_id("setup", "Set Up…").build(app)?);
+            }
         }
         Some(s) => {
             let now = Utc::now();
@@ -290,7 +507,11 @@ fn build_menu(app: &AppHandle, status: Option<&Status>) -> tauri::Result<Menu<ta
                 let label = truncate(&format!("{} {} — {detail}", push_glyph(&l.push), l.name), 70);
                 m = m.item(&MenuItemBuilder::with_id(format!("open:{}", l.name), label).build(app)?);
             }
-            m = m.separator().item(&MenuItemBuilder::with_id("sync", "Sync Now").build(app)?);
+            if s.libraries.is_empty() {
+                m = m.item(&MenuItemBuilder::with_id("noop-empty", "Nothing to sync yet").enabled(false).build(app)?);
+            }
+            m = m.item(&MenuItemBuilder::with_id("add", "Add a SharePoint Folder…").build(app)?);
+            m = m.separator().item(&MenuItemBuilder::with_id("sync", "Sync Now").enabled(!s.libraries.is_empty()).build(app)?);
             if s.libraries.iter().any(|l| l.state == LibraryState::Refused) {
                 m = m.item(&MenuItemBuilder::with_id("allow-deletions", "Allow Deletions and Sync…").build(app)?);
             }
@@ -307,9 +528,17 @@ fn build_menu(app: &AppHandle, status: Option<&Status>) -> tauri::Result<Menu<ta
             }
         }
     }
-    m.separator()
-        .item(&MenuItemBuilder::with_id("status", "Status…").build(app)?)
-        .item(&MenuItemBuilder::with_id("config", "Open Config File").build(app)?)
+    m = m.separator().item(&MenuItemBuilder::with_id("status", "Status…").build(app)?);
+    #[cfg(target_os = "macos")]
+    {
+        use looper_sharepoint_engine::login_item::{self, AppItem};
+        let item = match login_item::app_unavailable() {
+            Some(_) => CheckMenuItemBuilder::with_id("login-item", "Start at Login").enabled(false).checked(false).build(app)?,
+            None => CheckMenuItemBuilder::with_id("login-item", "Start at Login").checked(login_item::app_status() != AppItem::Off).build(app)?,
+        };
+        m = m.item(&item);
+    }
+    m.item(&MenuItemBuilder::with_id("config", "Open Config File").build(app)?)
         .item(&cli_menu_item(app, &st)?)
         .separator()
         .item(&MenuItemBuilder::with_id("quit", format!("Quit {}", app_name(&st))).build(app)?)
@@ -336,30 +565,35 @@ fn cli_menu_item(app: &AppHandle, st: &AppState) -> tauri::Result<tauri::menu::M
     }
 }
 
-/// The tray menu was rebuilt from outside a status event (the command line tool was installed or removed).
+/// The tray menu was rebuilt from outside a status event (the command line tool was installed or removed, the
+/// config changed, ...).
 fn refresh_menu(app: &AppHandle) {
     let st = app.state::<AppState>();
-    let status = st.svc.as_ref().map(Service::status);
-    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY_ID), build_menu(app, status.as_ref())) {
-        let _ = tray.set_menu(Some(menu));
+    let status = st.svc().map(|s| s.status());
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Ok(menu) = build_menu(app, status.as_ref()) {
+            let _ = tray.set_menu(Some(menu));
+        }
+        let _ = tray.set_tooltip(Some(tooltip(app)));
     }
 }
 
 fn on_menu(app: &AppHandle, id: &str) {
     let st = app.state::<AppState>();
+    let svc = st.svc();
     let result = match id {
-        "sync" => st.svc.as_ref().map(|s| s.trigger(None, Trigger::Manual)).transpose().map(|_| ()).map_err(|e| e.to_string()),
-        "reconnect" => st.svc.as_ref().map(|s| s.reconnect_push(None)).transpose().map(|_| ()).map_err(|e| e.to_string()),
+        "sync" => svc.as_ref().map(|s| s.trigger(None, Trigger::Manual)).transpose().map(|_| ()).map_err(|e| e.to_string()),
+        "reconnect" => svc.as_ref().map(|s| s.reconnect_push(None)).transpose().map(|_| ()).map_err(|e| e.to_string()),
         // The refusal explains what would be deleted; the status window shows it next to this same action.
         "allow-deletions" => show_status_window(app),
         "pause" => {
-            if let Some(s) = &st.svc {
+            if let Some(s) = &svc {
                 s.pause();
             }
             Ok(())
         }
         "resume" => {
-            if let Some(s) = &st.svc {
+            if let Some(s) = &svc {
                 s.resume();
             }
             Ok(())
@@ -370,14 +604,27 @@ fn on_menu(app: &AppHandle, id: &str) {
         }
         "status" => show_status_window(app),
         "config" => open_config_file(app, &st),
-        // The dialog lives in the status window: open it there (the hash covers a window that isn't loaded yet).
-        "cli-install" | "cli-remove" | "cli-repair" => show_status_window_at(app, &id[4..]).map(|_| {
+        // The onboarding and command line tool dialogs live in the status window: open it there (the hash covers a
+        // window that isn't loaded yet).
+        "setup" | "add" => show_status_window_at(app, "onboard").map(|_| {
+            let _ = app.emit("show-onboard", serde_json::json!({ "kind": id }));
+        }),
+        "login-item" => {
+            #[cfg(target_os = "macos")]
+            {
+                let on = looper_sharepoint_engine::login_item::app_status() == looper_sharepoint_engine::login_item::AppItem::Off;
+                set_login_item_now(&st, on).map(|_| refresh_menu(app))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Ok(())
+        }
+        "cli-install" | "cli-remove" | "cli-repair" => show_status_window_at(app, id).map(|_| {
             let _ = app.emit("show-cli", &id[4..]);
         }),
         "quit" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Some(svc) = app.state::<AppState>().svc.clone() {
+                if let Some(svc) = app.state::<AppState>().svc() {
                     // Let a run in progress finish, but don't hang forever.
                     let _ = tokio::time::timeout(Duration::from_secs(15), svc.shutdown()).await;
                 }
@@ -397,8 +644,9 @@ fn show_status_window(app: &AppHandle) -> Result<(), String> {
     show_status_window_at(app, "")
 }
 
-/// Show the status window; `dialog` (if any) is opened in it when the window is first created.
-fn show_status_window_at(app: &AppHandle, dialog: &str) -> Result<(), String> {
+/// Show the status window; `hash` (if any) names a dialog to open in it when the window is first created
+/// (`onboard`, `cli-install`, ...). An open window gets an event instead.
+fn show_status_window_at(app: &AppHandle, hash: &str) -> Result<(), String> {
     // A menu-bar-only (accessory) app can't bring a window to the front; become a regular app while a window is
     // open, and go back to menu-bar-only when it closes.
     #[cfg(target_os = "macos")]
@@ -408,7 +656,7 @@ fn show_status_window_at(app: &AppHandle, dialog: &str) -> Result<(), String> {
         let _ = w.unminimize();
         return w.set_focus().map_err(|e| e.to_string());
     }
-    let page = if dialog.is_empty() { "index.html".to_string() } else { format!("index.html#cli-{dialog}") };
+    let page = if hash.is_empty() { "index.html".to_string() } else { format!("index.html#{hash}") };
     let w = WebviewWindowBuilder::new(app, STATUS_WINDOW, WebviewUrl::App(page.into()))
         .title(app_name(&app.state::<AppState>()))
         .inner_size(820.0, 600.0)
@@ -429,7 +677,7 @@ fn show_status_window_at(app: &AppHandle, dialog: &str) -> Result<(), String> {
 }
 
 fn open_library_folder(app: &AppHandle, st: &AppState, name: &str) -> Result<(), String> {
-    let cfg = st.config.as_ref().ok_or("no config")?;
+    let cfg = st.config().ok_or("no config")?;
     let lib = cfg.library(name).ok_or("no such library")?;
     let path = cfg.local_root(lib);
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
@@ -459,7 +707,7 @@ fn open_config_file(app: &AppHandle, st: &AppState) -> Result<(), String> {
 
 fn start_sign_in(app: AppHandle) {
     let st = app.state::<AppState>();
-    let Some(cfg) = st.config.clone() else { return };
+    let Some(cfg) = st.config() else { return };
     {
         let mut busy = st.signing_in.lock().unwrap();
         if *busy {
@@ -481,54 +729,80 @@ fn start_sign_in(app: AppHandle) {
         match r {
             Ok(a) => {
                 tracing::info!(user = a.username, "signed in");
-                if let Some(svc) = &st.svc {
+                if let Some(svc) = st.svc() {
                     svc.signed_in();
                 }
             }
             Err(e) => tracing::warn!("sign-in failed: {e:#}"),
         }
+        let _ = app.emit("status-changed", ());
+        let _ = app.emit("signed-in", ());
     });
+}
+
+#[cfg(target_os = "macos")]
+fn set_login_item_now(st: &AppState, on: bool) -> Result<(), String> {
+    use looper_sharepoint_engine::login_item;
+    let state = login_item::set_app(on).map_err(|e| format!("{e:#}"))?;
+    let mut prefs = login_item::load_prefs(&st.data_dir);
+    prefs.user_turned_off = !on;
+    let _ = login_item::save_prefs(&st.data_dir, &prefs);
+    if state == login_item::AppItem::NeedsApproval {
+        login_item::open_settings();
+    }
+    Ok(())
 }
 
 // ---- commands for the status window ----
 
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> Snapshot {
-    let status = state.svc.as_ref().map(Service::status);
-    let headline = match (&status, &state.error) {
+    let svc = state.svc();
+    let status = svc.as_ref().map(Service::status);
+    let error = state.error();
+    let headline = match (&status, &error) {
+        (Some(s), _) if s.libraries.is_empty() => "Nothing to sync yet".into(),
         (Some(s), _) => s.headline(),
         (None, Some(e)) => first_line(e).to_string(),
         (None, None) => "Not running".into(),
     };
-    let mode = status.as_ref().map(Status::mode);
-    let mode_text = status.as_ref().map(|s| s.mode().describe(s.poll_interval_secs));
+    let mode = status.as_ref().filter(|s| !s.libraries.is_empty()).map(Status::mode);
+    let mode_text = status.as_ref().filter(|s| !s.libraries.is_empty()).map(|s| s.mode().describe(s.poll_interval_secs));
     Snapshot {
-        history: state.svc.as_ref().map(|s| s.history(50)).unwrap_or_default(),
+        history: svc.as_ref().map(|s| s.history(50)).unwrap_or_default(),
         status,
-        error: state.error.clone(),
+        error,
         config_path: state.config_path.display().to_string(),
         headline,
         mode_text,
         mode,
+        set_up: state.config().is_some(),
+        config_problem: state.config_problem.lock().unwrap().clone(),
+        notice: state.notice.lock().unwrap().clone(),
     }
 }
 
 #[tauri::command]
+fn dismiss_notice(state: State<'_, AppState>) {
+    *state.notice.lock().unwrap() = None;
+}
+
+#[tauri::command]
 fn sync_now(state: State<'_, AppState>, library: Option<String>) -> Result<(), String> {
-    let svc = state.svc.as_ref().ok_or("the sync service is not running")?;
+    let svc = state.svc().ok_or("the sync service is not running")?;
     svc.trigger(library.as_deref(), Trigger::Manual).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
 fn reconnect(state: State<'_, AppState>, library: Option<String>) -> Result<(), String> {
-    let svc = state.svc.as_ref().ok_or("the sync service is not running")?;
+    let svc = state.svc().ok_or("the sync service is not running")?;
     svc.reconnect_push(library.as_deref()).map_err(|e| format!("{e:#}"))
 }
 
 /// Re-run the refused libraries with the mass-delete guard overridden (the user saw what would be deleted).
 #[tauri::command]
 fn allow_deletions(state: State<'_, AppState>, library: Option<String>) -> Result<(), String> {
-    let svc = state.svc.clone().ok_or("the sync service is not running")?;
+    let svc = state.svc().ok_or("the sync service is not running")?;
     let refused: Vec<String> = svc
         .status()
         .libraries
@@ -549,7 +823,7 @@ fn allow_deletions(state: State<'_, AppState>, library: Option<String>) -> Resul
 
 #[tauri::command]
 fn set_paused(state: State<'_, AppState>, paused: bool) -> Result<(), String> {
-    let svc = state.svc.as_ref().ok_or("the sync service is not running")?;
+    let svc = state.svc().ok_or("the sync service is not running")?;
     if paused { svc.pause() } else { svc.resume() }
     Ok(())
 }
@@ -567,6 +841,169 @@ fn open_config(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
 #[tauri::command]
 fn sign_in(app: AppHandle) {
     start_sign_in(app);
+}
+
+// ---- setting up and adding (specs/onboarding-design.md §4, §5) ----
+
+/// What was opened from outside, if anything (once).
+#[tauri::command]
+fn take_pending(state: State<'_, AppState>) -> Option<Pending> {
+    state.pending.lock().unwrap().take()
+}
+
+#[tauri::command]
+fn setup_preview(state: State<'_, AppState>, source: String) -> Result<SetupPlan, String> {
+    onboard::plan_setup(&state.config_path, source.trim()).map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Serialize)]
+struct SetupResult {
+    #[serde(flatten)]
+    done: SetupDone,
+    signed_in: bool,
+}
+
+/// Apply a setup the user confirmed, start (or reload) the service, and sign in if needed.
+#[tauri::command]
+async fn setup_apply(app: AppHandle, source: String, replace: bool) -> Result<SetupResult, String> {
+    let st = app.state::<AppState>();
+    let plan = onboard::plan_setup(&st.config_path, source.trim()).map_err(|e| format!("{e:#}"))?;
+    let done = plan.apply(&st.config_path, replace).map_err(|e| format!("{e:#}"))?;
+    if done.switched || st.svc().is_none() {
+        restart(&app).await;
+    } else {
+        config_changed(&app).await;
+    }
+    let signed_in = st.config().is_some_and(|c| account::token_provider(&c, &st.data_dir).account().ok().flatten().is_some())
+        || std::env::var("LOOPER_SHAREPOINT_TEST_USERNAME").is_ok();
+    if !signed_in {
+        start_sign_in(app.clone());
+    }
+    Ok(SetupResult { done, signed_in })
+}
+
+#[tauri::command]
+async fn choose_setup_file(app: AppHandle) -> Option<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose the setup file")
+        .add_filter("Setup file", &[looper_sharepoint_engine::core::setup::EXTENSION, "toml"])
+        .pick_file(move |f| {
+            let _ = tx.send(f.and_then(|f| f.into_path().ok()));
+        });
+    rx.await.ok().flatten().map(|p| p.display().to_string())
+}
+
+/// A Graph client for the signed-in account.
+fn graph_for(st: &AppState) -> Result<(Config, GraphClient), String> {
+    let cfg = st.config().ok_or("not set up yet: set up first")?;
+    if std::env::var("LOOPER_SHAREPOINT_TEST_USERNAME").is_err() && account::token_provider(&cfg, &st.data_dir).account().ok().flatten().is_none() {
+        return Err("sign in first".into());
+    }
+    let tokens = tokens(&cfg, &st.data_dir);
+    let graph = GraphClient::with_rate(tokens, cfg.sync.max_requests_per_second);
+    Ok((cfg, graph))
+}
+
+#[tauri::command]
+async fn add_preview(state: State<'_, AppState>, link: String, library: Option<String>) -> Result<AddPlan, String> {
+    let (cfg, graph) = graph_for(&state)?;
+    let plan = onboard::plan_add(&graph, &cfg, link.trim(), library.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+    *state.last_add.lock().unwrap() = Some((format!("{}\n{}", link.trim(), library.unwrap_or_default()), plan.clone()));
+    Ok(plan)
+}
+
+#[derive(Serialize)]
+struct Added {
+    name: String,
+    path: String,
+}
+
+#[tauri::command]
+async fn add_apply(
+    app: AppHandle,
+    link: String,
+    library: Option<String>,
+    to: String,
+    read_only: bool,
+    adopt: bool,
+) -> Result<Added, String> {
+    let st = app.state::<AppState>();
+    let key = format!("{}\n{}", link.trim(), library.clone().unwrap_or_default());
+    let cached = st.last_add.lock().unwrap().clone().filter(|(k, _)| *k == key).map(|(_, p)| p);
+    let plan = match cached {
+        Some(p) => p,
+        None => {
+            let (cfg, graph) = graph_for(&st)?;
+            onboard::plan_add(&graph, &cfg, link.trim(), library.as_deref()).await.map_err(|e| format!("{e:#}"))?
+        }
+    };
+    let opts = AddOptions { to: PathBuf::from(to), name: None, read_only, adopt };
+    let (cfg, name) = plan.apply(&st.config_path, &opts).map_err(|e| format!("{e:#}"))?;
+    *st.last_add.lock().unwrap() = None;
+    config_changed(&app).await;
+    let path = cfg.library(&name).map(|l| cfg.local_root(l).display().to_string()).unwrap_or_default();
+    Ok(Added { name, path })
+}
+
+#[tauri::command]
+async fn choose_folder(app: AppHandle, start: Option<String>) -> Option<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut d = app.dialog().file().set_title("Choose the local folder");
+    if let Some(s) = start.map(|s| looper_sharepoint_engine::core::config::expand_tilde(&s)) {
+        // Start in the nearest folder that exists.
+        if let Some(dir) = s.ancestors().find(|a| a.is_dir()) {
+            d = d.set_directory(dir);
+        }
+    }
+    d.set_can_create_directories(true).pick_folder(move |f| {
+        let _ = tx.send(f.and_then(|f| f.into_path().ok()));
+    });
+    rx.await.ok().flatten().map(|p| p.display().to_string())
+}
+
+/// Stop syncing a library. Never deletes files.
+#[tauri::command]
+async fn remove_library(app: AppHandle, name: String) -> Result<String, String> {
+    let st = app.state::<AppState>();
+    let old = st.config().ok_or("not set up")?;
+    let (_, lib) = onboard::remove(&st.config_path, &name).map_err(|e| format!("{e:#}"))?;
+    let path = old.local_root(&lib).display().to_string();
+    config_changed(&app).await;
+    if st.config_problem.lock().unwrap().is_none() {
+        let _ = onboard::forget_state(&st.data_dir, lib.name());
+    }
+    Ok(path)
+}
+
+#[derive(Serialize)]
+struct LoginItemInfo {
+    on: bool,
+    needs_approval: bool,
+    unavailable: Option<String>,
+}
+
+#[tauri::command]
+fn login_item_info() -> LoginItemInfo {
+    #[cfg(target_os = "macos")]
+    {
+        use looper_sharepoint_engine::login_item::{self, AppItem};
+        let s = login_item::app_status();
+        LoginItemInfo { on: s != AppItem::Off, needs_approval: s == AppItem::NeedsApproval, unavailable: login_item::app_unavailable() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    LoginItemInfo { on: false, needs_approval: false, unavailable: Some("not supported on this platform yet".into()) }
+}
+
+#[tauri::command]
+fn set_login_item(app: AppHandle, state: State<'_, AppState>, on: bool) -> Result<LoginItemInfo, String> {
+    #[cfg(target_os = "macos")]
+    set_login_item_now(&state, on)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = (&state, on);
+    refresh_menu(&app);
+    Ok(login_item_info())
 }
 
 // ---- the command line tool (specs/install-cli-design.md) ----

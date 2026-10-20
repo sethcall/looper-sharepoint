@@ -67,8 +67,9 @@ struct Shared {
     /// The schedulers for the current config. A reload swaps in a new one.
     current: std::sync::RwLock<Arc<Inner>>,
     data_dir: PathBuf,
-    /// The config file this service runs from, if it has one (see [`Service::set_config_file`]).
-    config_file: Mutex<Option<PathBuf>>,
+    /// The config file this service runs from, if it has one (see [`Service::set_config_file`]), and its text as last
+    /// loaded.
+    config_file: Mutex<Option<(PathBuf, String)>>,
     /// One reload at a time.
     reloading: tokio::sync::Mutex<()>,
 }
@@ -156,19 +157,28 @@ impl Service {
     /// Name the config file this service was started from, so [`Service::reload_file`] (and a `reload` request from
     /// the CLI) can read it again. Hosts that keep the config elsewhere don't call this.
     pub fn set_config_file(&self, path: &Path) {
-        *self.shared.config_file.lock().unwrap() = Some(path.to_owned());
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        *self.shared.config_file.lock().unwrap() = Some((path.to_owned(), text));
     }
 
     pub fn config_file(&self) -> Option<PathBuf> {
-        self.shared.config_file.lock().unwrap().clone()
+        self.shared.config_file.lock().unwrap().as_ref().map(|(p, _)| p.clone())
     }
 
-    /// Read the config file again and [`reload`](Service::reload) it. A file that doesn't parse or check keeps the
-    /// current config running, and the error says why.
+    /// Read the config file again and [`reload`](Service::reload) it, unless it's unchanged since it was last loaded
+    /// (so a file watcher and a `reload` request for the same change reload once). A file that doesn't parse or check
+    /// keeps the current config running, and the error says why.
     pub async fn reload_file(&self) -> Result<()> {
         let path = self.config_file().context("this host wasn't started from a config file")?;
-        let config = Config::load(&path).with_context(|| format!("not reloaded: {} has a problem; still using the previous config", path.display()))?;
-        self.reload(config).await
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        if self.shared.config_file.lock().unwrap().as_ref().is_some_and(|(_, t)| *t == text) {
+            return Ok(());
+        }
+        let config = Config::parse(&text, &path)
+            .with_context(|| format!("not reloaded: {} has a problem; still using the previous config", path.display()))?;
+        self.reload(config).await?;
+        *self.shared.config_file.lock().unwrap() = Some((path, text));
+        Ok(())
     }
 
     /// The current config.
