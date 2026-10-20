@@ -5,4 +5,5 @@ pub mod ignore;
 pub mod naming;
 pub mod quickxor;
 pub mod reconcile;
+pub mod setup;
 pub mod state;

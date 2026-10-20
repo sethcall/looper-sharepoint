@@ -60,6 +60,20 @@ enum Cmd {
     Logout,
     /// Show the signed-in account
     Whoami,
+    /// Set up this computer for your organization, from the setup file or looper-sharepoint://setup link you were sent
+    #[command(args_conflicts_with_subcommands = true, after_help = SETUP_EXAMPLES)]
+    Setup {
+        #[command(subcommand)]
+        cmd: Option<SetupCmd>,
+        /// The setup file (<name>.looper-sharepoint), or a looper-sharepoint://setup link
+        source: Option<String>,
+        /// Don't ask before changing the config, or offer to sign in
+        #[arg(long)]
+        yes: bool,
+        /// Switch a computer that's set up for another organization or app
+        #[arg(long)]
+        replace: bool,
+    },
     /// Start syncing a SharePoint site, library or folder: paste its link from the browser
     #[command(after_help = ADD_EXAMPLES)]
     Add {
@@ -177,6 +191,32 @@ enum Cmd {
         yes: bool,
     },
 }
+
+#[derive(Subcommand)]
+enum SetupCmd {
+    /// Write a setup file (or link) for others, from this computer's config. It holds no secrets
+    Export {
+        /// Also include this computer's libraries (each with its local folder)
+        #[arg(long)]
+        with_libraries: bool,
+        /// Write the file here (e.g. Contoso.looper-sharepoint) instead of printing it
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Print a looper-sharepoint://setup link instead (organization and app only)
+        #[arg(long, conflicts_with_all = ["with_libraries", "output"])]
+        link: bool,
+    },
+}
+
+const SETUP_EXAMPLES: &str = "\
+Examples:
+  looper-sharepoint setup ~/Downloads/Contoso.looper-sharepoint
+  looper-sharepoint setup \"looper-sharepoint://setup?tenant=…&client_id=…&app_name=Contoso%20Sync\"
+  looper-sharepoint setup export --link                              # for someone else: a link to send
+  looper-sharepoint setup export -o Contoso.looper-sharepoint        # or a file (--with-libraries adds yours)
+
+A setup file or link only names your organization's tenant and app registration (and, in a file, libraries to add).
+It can't change how syncing behaves. Setup asks before changing anything, then offers to sign in.";
 
 const ADD_EXAMPLES: &str = "\
 Examples:
@@ -369,6 +409,15 @@ async fn run(cli: Cli, tui: bool, log_file: &Path) -> Result<ExitCode> {
                 );
                 println!("app: {} (client id {})", cfg.account.app_name, cfg.account.client_id);
             }
+        }
+        Cmd::Setup { cmd: Some(SetupCmd::Export { with_libraries, output, link }), .. } => {
+            return onboard::setup_export(&config_path, with_libraries, output.as_deref(), link);
+        }
+        Cmd::Setup { cmd: None, source: Some(source), yes, replace } => {
+            return onboard::setup(&config_path, &data, &source, yes, replace, cli.json).await;
+        }
+        Cmd::Setup { cmd: None, source: None, .. } => {
+            bail!("give the setup file or looper-sharepoint://setup link: `looper-sharepoint setup <file or link>`");
         }
         Cmd::Add { link, to, library, name, read_only, no_sync, adopt, yes } => {
             let args = onboard::AddArgs { link, to, library, name, read_only, no_sync, adopt, yes };
