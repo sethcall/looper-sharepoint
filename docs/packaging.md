@@ -58,6 +58,56 @@ The app is signed **only** by team `WDTD322L33` ("Developer ID Application: Mich
      ```
      This asks for the password and stores it in the keychain, never in the repo.
 
+## Releases from GitHub
+
+Pushing a tag `v<version>` runs [.github/workflows/release.yml](../.github/workflows/release.yml) on a GitHub macOS
+runner (arm64). It builds, signs, notarizes and staples the app with `scripts/package-macos.sh`, and attaches the
+`.dmg` to a GitHub release.
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0       # the tag must match the workspace version
+git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1   # a pre-release
+```
+
+[.github/workflows/ci.yml](../.github/workflows/ci.yml) runs clippy and the tests on every push and pull request. It
+uses no secrets.
+
+**Where the secrets are kept.**
+- The signing certificate and the notarization key are secrets of the repository's `release` **environment**.
+- Only workflow runs for `v*` tags can use that environment. Pull requests, including ones from forks, never see them.
+- In the runner, the certificate goes into a temporary keychain with a random password, and the `.p8` goes into the
+  runner's temp folder. Both are deleted at the end of the run.
+- The signing pins (team `WDTD322L33` only, never `HXL4V4VGHK`) are the same as for a local build.
+
+| Secret | What it is |
+|---|---|
+| `MACOS_CERTIFICATE_P12_BASE64` | The Developer ID Application identity (certificate and private key), as a base64 `.p12` |
+| `MACOS_CERTIFICATE_PASSWORD` | The `.p12`'s password |
+| `NOTARY_KEY_P8` | An App Store Connect API key, used by `notarytool` instead of an Apple ID and app-specific password |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | That key's ID and its issuer ID |
+
+**Setting them up (once, and again when the certificate or key is replaced):**
+1. **Export the identity.** In Keychain Access → login → My Certificates, select "Developer ID Application:
+   Michael Call (WDTD322L33)". Export it as a `.p12` with a strong password, e.g. into `certs/` (gitignored).
+2. **Make an API key.** In App Store Connect → Users and Access → Integrations → App Store Connect API, create a
+   team key with the **Developer** role. Download `AuthKey_<KEYID>.p8`; Apple only lets you download it once. Note
+   the **Issuer ID** shown above the list of keys.
+3. **Upload them.** This checks that the `.p12` is the WDTD322L33 Developer ID with its private key, asks for its
+   password, and uploads all five secrets with `gh`:
+   ```sh
+   just release-secrets certs/DeveloperID.p12 ~/Downloads/AuthKey_ABC123XYZ.p8 <issuer-id>
+   ```
+4. **Clean up.** Delete the exported `.p12`, and keep the `.p8` somewhere safe.
+
+**To revoke:**
+- Revoke the API key in App Store Connect; the next release then fails at notarization.
+- Replace the certificate at developer.apple.com (revoking a Developer ID certificate also affects apps already
+  signed with it).
+- Delete the secrets in the repository's Settings → Environments → release.
+
+The same API key also works for local builds: set `NOTARY_KEY`, `NOTARY_KEY_ID` and `NOTARY_ISSUER` before
+`just package-and-sign`.
+
 ## Checking a build
 
 ```sh

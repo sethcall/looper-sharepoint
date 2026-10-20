@@ -30,6 +30,10 @@ package-and-sign-no-notarize:
 notary-setup apple_id:
     xcrun notarytool store-credentials looper-sharepoint --apple-id {{apple_id}} --team-id WDTD322L33
 
+# One-time: upload the signing certificate and notarization key to GitHub for release builds (docs/packaging.md)
+release-secrets p12 p8 issuer:
+    scripts/github-release-secrets.sh {{p12}} {{p8}} {{issuer}}
+
 # Build the access request (.docx attachment + email text) into dist/ from local/access-request.env
 access-request:
     scripts/access-request.py

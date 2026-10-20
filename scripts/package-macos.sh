@@ -5,6 +5,9 @@
 #   --adhoc        sign with an ad-hoc signature (no certificate; runs only on this Mac). Implies --no-notarize.
 #   --no-notarize  sign but don't send to Apple (the .dmg then shows a Gatekeeper warning on other Macs).
 #
+# Notarization uses the keychain profile NOTARY_PROFILE (`just notary-setup`), or an App Store Connect API key when
+# NOTARY_KEY (the .p8 file), NOTARY_KEY_ID and NOTARY_ISSUER are set, as in .github/workflows/release.yml.
+#
 # Signing is pinned to TEAM_ID. Any other team, and JamKazam's team in particular, is refused, both when picking the
 # identity and when checking the signed result.
 set -euo pipefail
@@ -45,8 +48,16 @@ else
   done
   echo "signing as: $(echo "$matches" | head -1 | sed -E 's/^ *[0-9]+\) [0-9A-F]+ //')"
   if [ $notarize = 1 ]; then
-    xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 ||
-      die "no notarytool credentials named '$NOTARY_PROFILE'. Run: just notary-setup <apple-id>  (or pass --no-notarize)"
+    if [ -n "${NOTARY_KEY:-}" ]; then
+      [ -f "$NOTARY_KEY" ] && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER:-}" ] ||
+        die "NOTARY_KEY needs the .p8 file, NOTARY_KEY_ID and NOTARY_ISSUER"
+      notary=(--key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+    else
+      notary=(--keychain-profile "$NOTARY_PROFILE")
+    fi
+    xcrun notarytool history "${notary[@]}" >/dev/null 2>&1 ||
+      if [ -n "${NOTARY_KEY:-}" ]; then die "notarytool refused the API key in NOTARY_KEY"
+      else die "no notarytool credentials named '$NOTARY_PROFILE'. Run: just notary-setup <apple-id>  (or pass --no-notarize)"; fi
   fi
 fi
 
@@ -111,12 +122,12 @@ check_team "$dmg"
 # --- Notarize and staple ----------------------------------------------------------------------------------------------
 if [ $notarize = 1 ]; then
   step "Notarizing (this usually takes 1-5 minutes)"
-  out=$(xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json) || true
+  out=$(xcrun notarytool submit "$dmg" "${notary[@]}" --wait --output-format json) || true
   echo "$out"
   status=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
   if [ "$status" != "Accepted" ]; then
     id=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
-    [ -n "$id" ] && xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" || true
+    [ -n "$id" ] && xcrun notarytool log "$id" "${notary[@]}" || true
     die "notarization was not accepted (status: ${status:-unknown})"
   fi
   step "Stapling"
