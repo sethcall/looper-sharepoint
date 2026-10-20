@@ -88,16 +88,16 @@ uses no secrets.
 
 **Setting them up (once, and again when the certificate or key is replaced):**
 1. **Export the identity.** In Keychain Access → login → My Certificates, select "Developer ID Application:
-   Michael Call (WDTD322L33)". Export it as a `.p12` with a strong password, e.g. into `certs/` (gitignored).
+   Michael Call (WDTD322L33)". Export it as a `.p12` with a strong password into `cicd-secrets/` (gitignored, see its [README](../cicd-secrets/README.md)).
 2. **Make an API key.** In App Store Connect → Users and Access → Integrations → App Store Connect API, create a
    team key with the **Developer** role. Download `AuthKey_<KEYID>.p8`; Apple only lets you download it once. Note
    the **Issuer ID** shown above the list of keys.
 3. **Upload them.** This checks that the `.p12` is the WDTD322L33 Developer ID with its private key, asks for its
    password, and uploads all five secrets with `gh`:
    ```sh
-   just release-secrets certs/DeveloperID.p12 ~/Downloads/AuthKey_ABC123XYZ.p8 <issuer-id>
+   just release-secrets cicd-secrets/WDTD322L33.p12 cicd-secrets/AuthKey_<KEYID>.p8 <issuer-id>
    ```
-4. **Clean up.** Delete the exported `.p12`, and keep the `.p8` somewhere safe.
+4. **Keep** both files in `cicd-secrets/`: GitHub never shows a secret again.
 
 **To revoke:**
 - Revoke the API key in App Store Connect; the next release then fails at notarization.

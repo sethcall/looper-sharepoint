@@ -13,3 +13,7 @@
 
 # macOS Finder metadata
 .DS_Store
+
+# Signing and notarization secrets: only the README is tracked
+/cicd-secrets/*
+!/cicd-secrets/README.md
