@@ -1,0 +1,26 @@
+[package]
+name = "looper-sharepoint-tray"
+description = "Menu-bar / notification-area host for looper-sharepoint (Tauri v2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Packaged builds: sign-in tokens only in the OS keychain. scripts/package-macos.sh always sets it.
+release = ["looper-sharepoint-engine/release"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+looper-sharepoint-engine = { version = "0.1.0", path = "../../crates/looper-sharepoint-engine" }
+looper-sharepoint-ipc = { version = "0.1.0", path = "../../crates/looper-sharepoint-ipc" }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tokio = { version = "1.53.2", features = ["sync", "time", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

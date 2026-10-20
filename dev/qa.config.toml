@@ -1,0 +1,13 @@
+# Config for the QA tenant (Seth Call Dev Tenant). IDs only, no secrets.
+[account]
+tenant    = "d2586a15-4686-4a88-812c-ba8de27b089e"
+client_id = "0502adbe-a7e0-42e8-85ab-115d6efb1335"
+
+[sync]
+root = "~/SharePoint-QA"
+
+[[library]]
+site    = "https://sethcallgmail.sharepoint.com/sites/sharepoint-sync-qa"
+library = "Documents"
+local   = "qa"
+include = ["runs/m1-a/**"]

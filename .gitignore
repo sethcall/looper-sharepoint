@@ -1,0 +1,15 @@
+.env
+/target
+
+# Signing certificates and requests (local only)
+/certs/
+/dist/
+
+# Editor swap files
+.*.sw[a-p]
+
+# Organisation-specific values (e.g. the access request), never committed
+/local/
+
+# macOS Finder metadata
+.DS_Store

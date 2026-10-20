@@ -1,0 +1,44 @@
+# looper-sharepoint configuration.
+# Default location: `looper-sharepoint config path` (macOS: ~/Library/Application Support/looper-sharepoint/config.toml,
+# Windows: %APPDATA%\looper-sharepoint\config.toml). Unknown keys are an error.
+
+[account]
+tenant    = "contoso.onmicrosoft.com"                 # tenant domain or GUID
+client_id = "00000000-0000-0000-0000-000000000000"    # app registration (see docs/admin-setup.md)
+# auth_flow = "pkce"                                  # pkce (browser) | device_code
+# scopes = ["Files.ReadWrite.All", "Sites.Read.All", "offline_access", "User.Read", "openid", "profile"]
+# allowed_tenants = ["contoso.onmicrosoft.com"]
+# app_name  = "looper-sharepoint"                     # shown to users; set it to the app registration's display name
+# publisher = "looper-sharepoint"                     # your organization, sent in the User-Agent
+
+[sync]
+root = "~/SharePoint"
+# direction              = "two_way"         # two_way | download_only (a mirror: local changes are never uploaded)
+# watch                  = true              # two-way: upload local changes within seconds (else at the next check)
+# ignore                 = ["*.bak"]         # never upload these; added to the built-in list: OS junk, Office/LibreOffice
+#                                            # lock and temp files, vim swap/backup files, emacs autosaves
+# on_remote_delete       = "delete"          # delete | keep   (deleted files are recoverable from the SharePoint recycle bin)
+# local_orphans          = "keep"            # download_only: keep | delete   (files that exist only locally)
+# max_delete_fraction    = 0.25              # refuse a run that would delete more than this share of files, in either direction (min 10 files)
+# max_parallel_downloads = 4                 # parallel transfers (downloads and uploads)
+# push                   = true              # live updates: Microsoft notifies us of changes (no server needed)
+# push_safety_interval   = "15m"             # while live, still check this often in case a notification is missed (min 1m)
+# poll_interval          = "45s"             # how often to check when live updates are off or down (min 15s)
+# max_requests_per_second = 8                # client-side pacing, below SharePoint's per-user limit (1-10)
+
+# [naming]
+# mode = "escape"                            # escape | skip   (names the local OS can't store)
+# [naming.char_map]                          # remote char -> local char; defaults map " * : < > ? \ | to full-width lookalikes
+# ":" = "꞉"
+
+# [network]
+# min_tls = "1.3"                            # 1.3 (default) | 1.2, only for a TLS-inspecting proxy that can't do 1.3
+
+# `looper-sharepoint libraries` prints ready-to-paste blocks like this:
+[[library]]
+site    = "https://contoso.sharepoint.com/sites/Engineering"
+library = "Documents"
+local   = "engineering"
+# include = ["specs/**", "*.md"]
+# exclude = ["**/~$*", "**/*.tmp"]
+# read_only = true                           # never upload to this library, even with two_way

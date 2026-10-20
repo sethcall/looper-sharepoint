@@ -1,0 +1,29 @@
+[package]
+name = "looper-sharepoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Live tests against the QA tenant: cargo test -p looper-sharepoint --features live -- --test-threads=1
+live = []
+# Packaged builds: sign-in tokens only in the OS keychain. scripts/package-macos.sh always sets it.
+release = ["looper-sharepoint-engine/release"]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+looper-sharepoint-engine = { version = "0.1.0", path = "../looper-sharepoint-engine" }
+looper-sharepoint-ipc = { version = "0.1.0", path = "../looper-sharepoint-ipc" }
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+bytes = "1.12.1"
+futures-util = "0.3.34"
+tempfile = "3.27.0"

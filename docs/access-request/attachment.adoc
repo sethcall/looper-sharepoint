@@ -1,0 +1,155 @@
+= {app-name}: access request
+{requester}, {requester-role}
+{date}
+:toc:
+:toclevels: 1
+:sectnums:
+
+== Summary
+
+We ask to approve one Entra application, *{app-name}*, for a pilot of {pilot-users} people.
+
+* *What it is:* a desktop tool that keeps chosen SharePoint libraries in sync with a local folder.
+* *How it signs in:* as the user, with delegated permissions. It can only reach what that user can already reach.
+* *What we need:* the Entra admin creates the app registration and grants consent (<<entra-admin>>, about 10
+  minutes), then sends back two IDs.
+
+== Why we built it
+
+SharePoint is our source of truth for documents and permissions. The OneDrive sync client doesn't fit local-first
+work across teams:
+
+* You can't make it sync now, in either direction.
+* When it gets stuck, nothing shows it, or why.
+
+This tool fixes both. `sync` brings a library up to date and waits until it's done. Status always shows whether
+changes arrive live, when the last sync ran, and the last failure. Changes from SharePoint arrive in about 30
+seconds, and local changes upload in about 3 seconds.
+
+It lets small teams, and AI agents working on plain local files, share documentation now. Customer data and
+leadership-only material stay separated by SharePoint's own permissions. Nothing else gives us per-folder access
+control without a deep integration into another system.
+
+== Standard, documented integration
+
+The tool uses only Microsoft's public, documented interfaces, as Microsoft's developer documentation describes
+them. Microsoft's guidance laid out the whole integration; we followed it.
+
+* *Sign-in:* the Microsoft identity platform's
+  https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow[authorization code flow with PKCE]
+  in the system browser, or the
+  https://learn.microsoft.com/entra/identity-platform/v2-oauth2-device-code[device code flow].
+* *API:* Microsoft Graph v1.0 only. No beta or undocumented endpoints.
+* *Sync pattern:* Microsoft's
+  https://learn.microsoft.com/onedrive/developer/rest-api/concepts/scan-guidance?view=odsp-graph-online[guidance for detecting changes at scale]:
+  https://learn.microsoft.com/graph/api/driveitem-delta[delta] change tracking, the
+  https://learn.microsoft.com/graph/api/subscriptions-socketio[socket.io notification endpoint] instead of
+  polling, and the standard download and
+  https://learn.microsoft.com/graph/api/driveitem-createuploadsession[upload session] APIs.
+
+== Security
+
+[cols="1,3"]
+|===
+| Permissions | Delegated only: `Files.ReadWrite.All`, `Sites.Read.All`, `offline_access`, `User.Read`. The tool acts as the signed-in user; SharePoint's permissions decide what it can see.
+| Secrets | None. It's a public client, with no client secret or certificate to leak.
+| Sign-in | System browser, so our MFA, Conditional Access and SSO apply unchanged.
+| Tokens | Refresh token in the macOS keychain. Access tokens in memory only. Never in files or logs.
+| Network | Microsoft hosts only: `login.microsoftonline.com`, `graph.microsoft.com`, our `sharepoint.com` tenant, and Microsoft's notification service `*.pushnp.svc.ms`. No telemetry, no other services, no inbound connections.
+| Encryption | TLS 1.3 required on every connection, verified against all four hosts. Certificates are checked against the operating system's trust store.
+| Local | The local control socket is owner-only. Sync state lives outside the synced folder.
+| Code signing | The macOS app is signed with an Apple Developer ID and notarized by Apple.
+| Source | Available to the CRO's team on request.
+|===
+
+== Respecting SharePoint
+
+* *Deletes:* deleted in SharePoint means deleted locally (configurable to keep). Anything the tool deletes in
+  SharePoint goes to the recycle bin, recoverable for 93 days. It never deletes permanently.
+* *Overwrites:* edits upload in place, so version history is kept. An upload only succeeds if SharePoint still has
+  the version the tool last saw. If both sides changed, both versions are kept.
+* *Mass deletes:* a sync that would delete more than 25% of a library is refused until someone allows it.
+* *Read-only:* a library, or the whole tool, can be set to download only.
+
+== Load on SharePoint
+
+SharePoint limits each app's requests in resource units (RU). We followed Microsoft's
+https://learn.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online[throttling guidance]
+and https://learn.microsoft.com/graph/throttling-limits[Graph limits]: change tracking instead of scanning, push
+notifications instead of frequent polling, client-side pacing, honouring `Retry-After`, and a registered app with
+an identifying User-Agent.
+
+With {licenses} licenses, this app may use *{ru-day} RU a day* and *{ru-min} RU a minute*. For {pilot-users} people,
+each syncing {libs} libraries (costs measured on a test tenant):
+
+[cols="3,1,1"]
+|===
+| Scenario | RU a day | Share of limit
+
+| Typical
+| {typ-total}
+| *{typ-pct}*
+
+| Notifications blocked by the network, so polling
+| {poll-total}
+| {poll-pct}
+
+| Every library changing constantly, all day
+| {busy-total}
+| {busy-pct}
+|===
+
+* The typical case averages {typ-min-pct} of the per-minute limit.
+* The budget is per app, not per user, so it doesn't grow with the pilot. At the typical rate it covers about
+  {capacity} people.
+* Each person's first sync downloads their libraries, the one heavy moment. We'll start at most
+  {first-sync-max} first syncs at a time.
+
+== Alternatives considered
+
+* *OneDrive sync client:* can't be told to sync, and doesn't show when it's stuck.
+* *rclone, and the open-source onedrive client:* capable, but general-purpose tools with many backends and options.
+  They aren't built around enterprise controls: one approved app, refusing mass deletes, never deleting permanently,
+  and visible sync health.
+* *A deep integration elsewhere:* possible later. It doesn't help teams now.
+
+== Other apps on the same engine
+
+The command line tool, the menu-bar app, and any later app built on the same library use this one registration.
+One approval covers all of them, and every admin control applies to all of them. They share one request budget.
+The permissions are fixed in the library, so a new app can't ask for more without a new admin consent.
+
+[[entra-admin]]
+== For the Entra admin
+
+Please create the registration and grant consent. It takes about 10 minutes, or run the script below.
+
+. *Entra admin center → App registrations → New registration*
+** Name: `{app-name}`
+** Supported account types: Accounts in this organizational directory only
+** Redirect URI: Public client/native (mobile & desktop), `http://localhost`
+. *Authentication:* Allow public client flows = *Yes*. This enables device-code sign-in; leave it *No* to allow
+  browser sign-in only.
+. *API permissions → Add → Microsoft Graph → Delegated:* `Files.ReadWrite.All`, `Sites.Read.All`, `offline_access`,
+  `User.Read`. Then *Grant admin consent*.
+. *Certificates & secrets:* nothing. The app needs none.
+. *Recommended:* Enterprise applications → {app-name} → Properties → *Assignment required = Yes*, then assign the
+  pilot group.
+. *Send back:* the *Directory (tenant) ID* and the *Application (client) ID* from the app's Overview. They aren't
+  secrets.
+
+*Optional, tighter scope:* use delegated `Sites.Selected` instead of the two `.All` permissions, then grant the app
+access to specific sites. Nothing else is reachable, even for users with wider rights.
+
+*Revoking:* disable the enterprise application to stop all use at once, remove a user's assignment, or revoke a
+user's sessions.
+
+*Script* (Azure CLI, after `az login` as an admin). It does all of the above except assigning the pilot group,
+and prints the two IDs:
+
+[source,bash]
+----
+include::create-registration.sh[]
+----
+
+Run it as: `create-registration.sh "{app-name}"`
