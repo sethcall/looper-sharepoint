@@ -33,8 +33,35 @@ use looper_sharepoint_ipc::{Request, Response};
 const ENV_TEST_USER: &str = "LOOPER_SHAREPOINT_TEST_USERNAME";
 const ENV_TEST_PASSWORD: &str = "LOOPER_SHAREPOINT_TEST_PASSWORD";
 
+const SETUP_STEPS: &str = "\
+Set up (once):
+  1. looper-sharepoint setup <file or link>    your organization's setup file (<name>.looper-sharepoint) or
+                                               looper-sharepoint://setup link: ask whoever gave you this tool
+  2. looper-sharepoint login                   sign in with your work account, in the browser
+  3. looper-sharepoint add <SharePoint link> --to <folder>
+                                               a site, library or folder: copy the address from the browser.
+                                               Repeat for each one; each syncs into its own folder
+  4. looper-sharepoint start-at-login on       keep syncing after restarts (the menu-bar app does this itself)
+
+Then it keeps itself in sync while the menu-bar app (or `looper-sharepoint run`) runs: local edits upload within
+seconds, and SharePoint's changes arrive within about 30 seconds.";
+
+const MORE_HELP: &str = "\
+Every command has its own help with examples: `looper-sharepoint <command> --help`. Every command takes --json.
+Exit codes: 0 fine, 1 something needs attention (a conflict, an error on some files, a refused change), 2 failed.
+Nothing is ever deleted for good: deletes go to the SharePoint site's recycle bin, and local files set aside go to
+`not-uploaded/`. Docs: docs/QUICKSTART.md and docs/user-guide.md in the source.";
+
 #[derive(Parser)]
-#[command(name = "looper-sharepoint", version, about = "Sync SharePoint document libraries to local folders")]
+#[command(
+    name = "looper-sharepoint",
+    version,
+    about = "Sync SharePoint document libraries and folders to local folders, both ways, and keep them in sync.",
+    before_help = SETUP_STEPS,
+    after_help = MORE_HELP,
+    help_template = "{about-with-newline}\n{before-help}{usage-heading} {usage}\n\n{all-args}{after-help}",
+    arg_required_else_help = true
+)]
 struct Cli {
     /// Path to config.toml (default: the OS config dir, e.g. ~/Library/Application Support/looper-sharepoint/config.toml)
     #[arg(long, global = true, env = "LOOPER_SHAREPOINT_CONFIG")]
@@ -51,15 +78,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(display_order = 2, after_help = "Examples:\n  looper-sharepoint login\n  looper-sharepoint login --device-code        # no browser on this machine: enter a code on another device")]
     /// Sign in (opens a browser; --device-code for headless machines)
     Login {
         #[arg(long)]
         device_code: bool,
     },
+    #[command(display_order = 15)]
     /// Forget the stored sign-in
     Logout,
+    #[command(display_order = 14)]
     /// Show the signed-in account
     Whoami,
+    #[command(display_order = 1)]
     /// Set up this computer for your organization, from the setup file or looper-sharepoint://setup link you were sent
     #[command(args_conflicts_with_subcommands = true, after_help = SETUP_EXAMPLES)]
     Setup {
@@ -74,6 +105,7 @@ enum Cmd {
         #[arg(long)]
         replace: bool,
     },
+    #[command(display_order = 3)]
     /// Start syncing a SharePoint site, library or folder: paste its link from the browser
     #[command(after_help = ADD_EXAMPLES)]
     Add {
@@ -103,28 +135,33 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    #[command(display_order = 4, after_help = "Examples:\n  looper-sharepoint start-at-login on\n  looper-sharepoint start-at-login status\n  looper-sharepoint start-at-login off")]
     /// Keep syncing after restarts: start the menu-bar app (or, with only this tool, `run`) at login
     #[cfg(unix)]
     StartAtLogin {
         #[arg(value_enum, default_value_t = LoginWhat::Status)]
         what: LoginWhat,
     },
+    #[command(display_order = 5, after_help = "Examples:\n  looper-sharepoint status                     # the libraries and their names\n  looper-sharepoint remove engineering")]
     /// Stop syncing a library. Never deletes files, here or in SharePoint
     Remove {
         /// The library's name (as `status` shows it)
         name: String,
     },
-    /// List sites and document libraries you can access, as ready-to-paste [[library]] blocks
+    #[command(display_order = 12, after_help = "Examples:\n  looper-sharepoint libraries\n  looper-sharepoint libraries --site https://contoso.sharepoint.com/sites/Engineering")]
+    /// List sites and document libraries you can access, as [[library]] blocks (`add <link>` writes one for you)
     Libraries {
         /// Only this site (URL)
         #[arg(long)]
         site: Option<String>,
     },
+    #[command(display_order = 13)]
     /// Configuration commands
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    #[command(display_order = 6, after_help = "Examples:\n  looper-sharepoint sync\n  looper-sharepoint sync --library engineering --dry-run\n  looper-sharepoint sync --allow-mass-delete    # after a refusal you checked: deletes go to the recycle bin")]
     /// Sync now and wait. Uses the running host if there is one; otherwise syncs in this process
     Sync {
         /// Only the library with this `local` name
@@ -137,12 +174,14 @@ enum Cmd {
         #[arg(long)]
         allow_mass_delete: bool,
     },
+    #[command(display_order = 7, after_help = "Examples:\n  looper-sharepoint run                        # TUI: s sync, a sync all, r reconnect, p pause, q quit\n  looper-sharepoint run --no-tui               # log lines, e.g. under a service manager")]
     /// Run the sync service in the foreground (TUI on a terminal; log lines otherwise)
     Run {
         /// Plain log lines instead of the TUI
         #[arg(long)]
         no_tui: bool,
     },
+    #[command(display_order = 9)]
     /// Ask the running host to sync now, without waiting
     Trigger {
         #[arg(long)]
@@ -151,17 +190,20 @@ enum Cmd {
         #[arg(long)]
         reconnect: bool,
     },
+    #[command(display_order = 8, after_help = "Examples:\n  looper-sharepoint status\n  looper-sharepoint status --history 30 --json")]
     /// Show per-library sync state and recent runs (live from the running host, else from local state)
     Status {
         /// How many recent runs to show
         #[arg(long, default_value_t = 10)]
         history: usize,
     },
+    #[command(display_order = 10)]
     /// Who can read or write a folder or file: show, set, check
     Access {
         #[command(subcommand)]
         cmd: AccessCmd,
     },
+    #[command(display_order = 11, after_help = "Examples:\n  looper-sharepoint web ~/work/engineering/Plans permissions\n  looper-sharepoint web --library engineering Plans/Q3.docx versions --print")]
     /// Open a folder or file in SharePoint, or one of its pages (permissions, versions, recycle bin…)
     Web {
         #[command(flatten)]
@@ -173,6 +215,7 @@ enum Cmd {
         #[arg(long)]
         print: bool,
     },
+    #[command(display_order = 16)]
     /// Put this `looper-sharepoint` on the PATH (a link to it, so app updates carry over)
     #[cfg(unix)]
     InstallCli {
@@ -189,6 +232,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    #[command(display_order = 17)]
     /// Remove the link `install-cli` made (only if it's still ours)
     #[cfg(unix)]
     UninstallCli {
@@ -271,11 +315,13 @@ enum WebPage {
 #[derive(Subcommand)]
 enum AccessCmd {
     /// List who has access, and whether the item has its own permissions
+    #[command(after_help = "Examples:\n  looper-sharepoint access show ~/work/engineering/Board\n  looper-sharepoint access show --library engineering Board --json")]
     Show {
         #[command(flatten)]
         at: ItemArg,
     },
     /// Make exactly these people the ones who can read and write it (the site owners always keep access)
+    #[command(after_help = "Examples:\n  looper-sharepoint access set ~/work/engineering/Board --write ann@contoso.com --read bo@contoso.com --dry-run\n  looper-sharepoint access set --library engineering Board --owners-only --yes")]
     Set {
         #[command(flatten)]
         at: ItemArg,
@@ -305,6 +351,7 @@ enum AccessCmd {
         allow_external: bool,
     },
     /// Can this person read or write it? PERSON is an email address or user name, or `me` (tested for real)
+    #[command(after_help = "Examples:\n  looper-sharepoint access check me ~/work/engineering/Board\n  looper-sharepoint access check ann@contoso.com --library engineering Board")]
     Check {
         person: String,
         #[command(flatten)]
@@ -372,8 +419,8 @@ async fn run(cli: Cli, tui: bool, log_file: &Path) -> Result<ExitCode> {
     let load = || {
         if !config_path.exists() {
             anyhow::bail!(
-                "not set up yet: no config file at {}. Create it with your organization's tenant and client_id \
-                 (see config.example.toml and docs/user-guide.md)",
+                "not set up yet (no config file at {}): run `looper-sharepoint setup <file or link>` with the setup \
+                 file or looper-sharepoint://setup link from whoever gave you this tool",
                 config_path.display()
             );
         }

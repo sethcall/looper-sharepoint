@@ -37,41 +37,30 @@ Windows. It's configured with a single file and gives enterprises optional contr
   - A missing or empty local folder never deletes anything in SharePoint.
   - Deletes in either direction are recoverable from the SharePoint recycle bin.
 
-Not yet: Files On-Demand placeholders, installers, admin policy files, or Windows validation (M5). See `specs/` for what's planned.
+- Setup in a few steps ([docs/QUICKSTART.md](docs/QUICKSTART.md)): a setup link or file from your organization, then
+  `add <SharePoint link>` (or **Add a SharePoint Folder…** in the app). Each library, or a single folder of one, syncs
+  into any folder you choose. The app starts at login.
+- A signed macOS app (`.dmg`) with a menu-bar icon, a status window and an optional command line tool.
+
+Not yet: Files On-Demand placeholders, a Windows installer, admin policy files, or Windows validation (M5). See
+`specs/` for what's planned.
 
 ## Quick start
 
-1. Have a tenant admin register the app. See [docs/admin-setup.md](docs/admin-setup.md); it takes about 15 minutes.
-2. Create a config. Start from [config.example.toml](config.example.toml); `looper-sharepoint config path` shows where it goes.
-3. Run:
+Install the app, set it up with your organization's setup link or file, sign in, then add a SharePoint site or
+folder by pasting its address:
 
 ```sh
-cargo build --release
-./target/release/looper-sharepoint login          # opens a browser; --device-code for headless machines
-./target/release/looper-sharepoint libraries      # prints [[library]] blocks to paste into config.toml
-./target/release/looper-sharepoint config check   # validates config and resolves each library
-./target/release/looper-sharepoint sync --dry-run
-./target/release/looper-sharepoint sync
-./target/release/looper-sharepoint run            # keep syncing; TUI (s sync, a sync all, r reconnect, p pause, q quit)
+looper-sharepoint setup "looper-sharepoint://setup?tenant=…&client_id=…&app_name=Contoso%20Sync"
+looper-sharepoint login
+looper-sharepoint add "https://contoso.sharepoint.com/sites/Engineering/Shared Documents/Specs" --to ~/workspace/specs
 ```
 
-From another terminal, while a host (`run` or the tray) is running:
+It keeps itself in sync from then on (the menu-bar app starts at login). In the app, the same steps are **Set Up…** and
+**Add a SharePoint Folder…**.
 
-```sh
-./target/release/looper-sharepoint status         # live: mode (live/polling), state, next check, last sync, last failure
-./target/release/looper-sharepoint trigger        # sync now, don't wait
-./target/release/looper-sharepoint trigger --reconnect   # reconnect live updates now
-./target/release/looper-sharepoint sync           # sync now through the host, and wait (the "git pull")
-```
-
-The tray app runs the same service from the menu bar (macOS) or notification area (Windows):
-
-```sh
-cargo run --release -p looper-sharepoint-tray     # add `-- --status` to open the status window at launch
-```
-
-Only one host runs per machine and user; a second one exits with the first one's pid. Every command accepts
-`--json`. `sync` exits with code 1 if any item ended in conflict or error, and 2 on a fatal error.
+For more examples and setup details, see [docs/QUICKSTART.md](docs/QUICKSTART.md). Someone has to register the app
+in your organization once first: [docs/admin-setup.md](docs/admin-setup.md), about 15 minutes.
 
 ## Sync behavior
 

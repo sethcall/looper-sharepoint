@@ -1,6 +1,6 @@
 # Design: onboarding (setup file and link, `add <link>`, a folder per library, start at login, quickstart)
 
-Status: **in progress** (2026-10-20). Approved with the revisions (`looper-sharepoint://` links, any local folder per
+Status: **built** (2026-10-20); the manual checks below need the packaged app. Approved with the revisions (`looper-sharepoint://` links, any local folder per
 library, a SharePoint folder synced directly into it).
 
 | Step | State |
@@ -12,7 +12,12 @@ library, a SharePoint folder synced directly into it).
 | §4 setup file and link (CLI: `setup`, `setup export`) | Built; offline test `setup_from_link_and_file_and_export`, tried end to end against QA |
 | §7 `looper-sharepoint://` and `.looper-sharepoint` opened in the app | Built (Info.plist, `RunEvent::Opened`). Manual: needs the packaged app in Applications |
 | §8 start at login | Built: tray menu item, on after the first sync, `start-at-login on\|off\|status`. Manual: needs the packaged app |
-| §9, §10 help, quickstart, README | |
+| §9, §10 help, quickstart, README | Built: `--help` opens with the setup steps, commands in task order, examples on the everyday commands; `docs/QUICKSTART.md`; README points to it. Test `docs_and_help_examples_parse` runs every command line in the docs and help examples |
+
+**Manual checks (packaged app in Applications):** click a `looper-sharepoint://setup` link in Mail, Safari and Teams;
+open a `.looper-sharepoint` file from Finder; the Set Up and Add windows end to end (including **Choose…**, a
+non-empty folder, and a site with several libraries); Stop syncing; Start at Login after the first sync, across a
+restart, and off in System Settings; `start-at-login` from the app's command line tool.
 
 ## 1. Goal
 

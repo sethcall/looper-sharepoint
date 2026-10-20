@@ -26,17 +26,24 @@ folder under `sync.root`.
 
 ## 2. Setting up
 
+The short version, for the app and for Terminal: [QUICKSTART.md](QUICKSTART.md). In detail:
+
 1. **Install or build:**
    - **From the `.dmg`:** drag Looper SharePoint to Applications (without admin rights: to `~/Applications`), and open
      it from there. Then choose **Install Command Line Tool…** in its menu, so `looper-sharepoint` works in Terminal
      (§2.1).
    - **From source:** `cargo build --release` gives `target/release/looper-sharepoint`. The tray app builds with
      `cargo build --release -p looper-sharepoint-tray`.
-2. **Create the config:**
-   - `looper-sharepoint config path` shows where it lives. On macOS that's
-     `~/Library/Application Support/looper-sharepoint/config.toml`.
-   - Start from [config.example.toml](../config.example.toml), and fill in `account.tenant` and `account.client_id`
-     from your admin.
+2. **Set up for your organization:** `looper-sharepoint setup <file or link>`, or open the setup file or
+   `looper-sharepoint://setup` link in the app (**Set Up…** in its menu).
+   - It writes the config's `[account]` (tenant, app id, app name) and any libraries the file lists, after showing
+     them and asking. A setup file or link can't change sync settings. Another organization needs `--replace`.
+   - To make one for others: `looper-sharepoint setup export --link`, or `setup export -o <name>.looper-sharepoint`
+     (`--with-libraries` adds yours). Neither holds secrets.
+   - Or by hand: `looper-sharepoint config path` shows where the config lives (macOS:
+     `~/Library/Application Support/looper-sharepoint/config.toml`). Start from
+     [config.example.toml](../config.example.toml), and fill in `account.tenant` and `account.client_id` from your
+     admin.
 3. **Sign in:** `looper-sharepoint login` opens your browser. Use `--device-code` on a machine without one.
    - The sign-in is kept in the macOS keychain.
    - `whoami` shows the account; `logout` forgets it.
@@ -55,7 +62,10 @@ folder under `sync.root`.
 6. **Preview, then sync:**
    - `looper-sharepoint sync --dry-run` shows what would happen and changes nothing.
    - `looper-sharepoint sync` does a first full sync.
-7. **Keep it running:** use `looper-sharepoint run` or the tray app (§4).
+7. **Keep it running:** use the tray app or `looper-sharepoint run` (§4).
+   - **Start at login:** the app turns this on after its first sync (**Start at Login** in its menu, or System Settings
+     → General → Login Items, turns it off). `looper-sharepoint start-at-login on|off|status` is the same switch;
+     with only the command line tool, it installs a LaunchAgent that runs `looper-sharepoint run --no-tui` at login.
 
 A minimal config:
 
@@ -187,11 +197,18 @@ A cloud icon shows the state:
 - **The menu** has:
   - the headline and the live/polling line;
   - one line per library (click to open its folder);
+  - **Add a SharePoint Folder…** (paste a site, library or folder link, choose the local folder), or **Set Up…**
+    before the app is set up;
   - Sync Now, Pause/Resume;
   - Reconnect Live Updates, Sign In… and Allow Deletions and Sync…, each shown when needed;
-  - Status…, Open Config File and Quit.
+  - Status…, **Start at Login**, Open Config File, the command line tool, and Quit.
 - **The status window** shows the same information as the TUI. It also has buttons for per-library sync, opening
-  folders and allowing a refused deletion.
+  folders, **Stop syncing…** (never deletes files) and allowing a refused deletion.
+- **Opening a setup file or `looper-sharepoint://` link** (from Finder, Mail, a browser or chat) opens the matching
+  window, which shows what it would do and asks first. macOS knows about them once the app is in Applications and
+  has been opened.
+- **The config file** is read again whenever it's saved (by you, `add`, `remove` or `setup`). A mistake keeps the
+  previous settings running and shows the problem.
 - **Logs:** `~/Library/Application Support/looper-sharepoint/logs/tray.log`.
 
 ### From another terminal, while a host runs
