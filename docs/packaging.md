@@ -69,8 +69,20 @@ git tag v0.1.0 && git push origin v0.1.0       # the tag must match the workspac
 git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1   # a pre-release
 ```
 
+Each full release is marked **latest**. It carries the dmg twice, under its versioned name and as
+`Looper-SharePoint.dmg`, so this link always downloads the newest one:
+
+  https://github.com/sethcall/looper-sharepoint/releases/latest/download/Looper-SharePoint.dmg
+
+Pre-releases (tags with a `-` suffix) are never marked latest.
+
 [.github/workflows/ci.yml](../.github/workflows/ci.yml) runs clippy and the tests on every push and pull request. It
 uses no secrets.
+
+- **On `main`, it also packages the app unsigned** (`--adhoc`). This checks packaging and saves the build folder and
+  the Tauri CLI to the Actions cache.
+- **Release runs only restore those caches.** A tag's run can't read caches saved by other tags, and never saves any.
+- **The Tauri CLI version** (2.12.1) is written in both workflows; change it in both.
 
 **Where the secrets are kept.**
 - The signing certificate and the notarization key are secrets of the repository's `release` **environment**.

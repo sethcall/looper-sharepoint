@@ -27,6 +27,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The packaging build folder and the Tauri CLI, as last saved by CI's `package` job on main. A tag's run can only
+      # read caches saved on main or on that same tag, so releases only restore them and never save.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: package
+          workspaces: ". -> target/package"
+          cache-bin: false
+          save-if: false
 
       - name: Check the tag matches the version
         run: |
@@ -34,7 +42,15 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           [ "${tag%%-*}" = "$version" ] || { echo "::error::tag $GITHUB_REF_NAME doesn't match version $version"; exit 1; }
 
+      # Keep the version the same here and in ci.yml.
+      - name: Restore the Tauri CLI
+        id: tauri-cli
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-2.12.1-${{ runner.os }}-${{ runner.arch }}
       - name: Install the Tauri CLI
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
         run: cargo install tauri-cli --version 2.12.1 --locked
 
       - name: Import the signing certificate into a temporary keychain
@@ -72,9 +88,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pre=""
-          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/*.dmg --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $pre
+          # A full release is marked latest, so .../releases/latest/download/Looper-SharePoint.dmg always gets it.
+          kind="--latest"
+          case "$GITHUB_REF_NAME" in *-*) kind="--prerelease --latest=false" ;; esac
+          dmg=$(ls dist/*.dmg)
+          cp "$dmg" dist/Looper-SharePoint.dmg
+          gh release create "$GITHUB_REF_NAME" "$dmg" dist/Looper-SharePoint.dmg --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes $kind
 
       - name: Remove the keychain and key
         if: always()

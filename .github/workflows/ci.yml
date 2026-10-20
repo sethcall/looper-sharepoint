@@ -1,5 +1,8 @@
 # Build, lint and test on every push and pull request. No secrets: the live SharePoint tests (`--features live`) need
 # the QA tenant and run only on a developer's Mac.
+#
+# On main, `package` also builds the app unsigned (`package-macos.sh --adhoc`). That checks packaging still works and
+# saves the caches release.yml restores: a tag's run can only read caches saved on main.
 name: CI
 
 on:
@@ -25,3 +28,26 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  package:
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: package
+          workspaces: ". -> target/package"
+          cache-bin: false
+      # Keep the version the same here and in release.yml.
+      - name: Cache the Tauri CLI
+        id: tauri-cli
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-2.12.1-${{ runner.os }}-${{ runner.arch }}
+      - name: Install the Tauri CLI
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version 2.12.1 --locked
+      - run: scripts/package-macos.sh --adhoc

@@ -6,7 +6,7 @@ Sync a SharePoint site, library or folder to a folder on your Mac, both ways, an
 
 You need:
 
-- the app (`Looper-SharePoint-<version>.dmg`);
+- the app: [Looper-SharePoint.dmg](https://github.com/sethcall/looper-sharepoint/releases/latest/download/Looper-SharePoint.dmg) (the latest release, for Apple Silicon Macs);
 - your organization's **setup link** (`looper-sharepoint://setup?…`) or **setup file** (`Contoso.looper-sharepoint`),
   from whoever set this up;
 - access to the site in SharePoint (if you can open it in the browser, you can sync it).
@@ -74,7 +74,7 @@ looper-sharepoint setup export --link                            # a link to pas
 looper-sharepoint setup export -o Contoso.looper-sharepoint      # or a file to attach (--with-libraries adds yours)
 ```
 
-Send the dmg, the setup link (or file), and the link to the SharePoint site. Neither holds passwords or secrets: they
+Send the download link above, the setup link (or file), and the link to the SharePoint site. Neither holds passwords or secrets: they
 name your organization's tenant and its app registration. A setup link or file can't change how syncing behaves.
 
 Chat apps and Outlook don't always make `looper-sharepoint://` links clickable. The file always works, and so does

@@ -40,7 +40,8 @@ Windows. It's configured with a single file and gives enterprises optional contr
 - Setup in a few steps ([docs/QUICKSTART.md](docs/QUICKSTART.md)): a setup link or file from your organization, then
   `add <SharePoint link>` (or **Add a SharePoint Folder…** in the app). Each library, or a single folder of one, syncs
   into any folder you choose. The app starts at login.
-- A signed macOS app (`.dmg`) with a menu-bar icon, a status window and an optional command line tool.
+- A signed macOS app with a menu-bar icon, a status window and an optional command line tool:
+  [download the latest `.dmg`](https://github.com/sethcall/looper-sharepoint/releases/latest/download/Looper-SharePoint.dmg) (Apple Silicon).
 
 Not yet: Files On-Demand placeholders, a Windows installer, admin policy files, or Windows validation (M5). See
 `specs/` for what's planned.
