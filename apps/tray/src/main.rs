@@ -429,7 +429,8 @@ fn show_status_window_at(app: &AppHandle, dialog: &str) -> Result<(), String> {
 
 fn open_library_folder(app: &AppHandle, st: &AppState, name: &str) -> Result<(), String> {
     let cfg = st.config.as_ref().ok_or("no config")?;
-    let path = cfg.root().join(name);
+    let lib = cfg.library(name).ok_or("no such library")?;
+    let path = cfg.local_root(lib);
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }

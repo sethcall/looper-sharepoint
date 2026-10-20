@@ -1,7 +1,16 @@
 # Design: onboarding (setup file and link, `add <link>`, a folder per library, start at login, quickstart)
 
-Status: **draft for review** (2026-10-20, revised the same day: `looper-sharepoint://` links, any local folder per
-library, a SharePoint folder synced directly into it). Decisions to confirm in §12.
+Status: **in progress** (2026-10-20). Approved with the revisions (`looper-sharepoint://` links, any local folder per
+library, a SharePoint folder synced directly into it).
+
+| Step | State |
+|---|---|
+| Probe: `/shares` for plain links | Done: it resolves folder and library URLs, `AllItems.aspx?id=` pages, file URLs and sharing links to the item. A site URL gives 400 for `driveItem`, but `/shares/{url}/site` works |
+| §3 a folder per library, a folder as the root | Built; live test `folder_as_library_root` |
+| §5, §6 `add`, `remove`, reload | Next |
+| §4, §7 setup file and links | |
+| §8 start at login | |
+| §9, §10 help, quickstart, README | |
 
 ## 1. Goal
 
@@ -74,18 +83,26 @@ path   = "/foo/bar"                # any folder; `~` allowed
 SharePoint's delta works only from the drive's root, not from a folder (OneDrive personal is the exception), so:
 
 - **Following the folder:** the folder is looked up once and **tracked by item id, not by path**. If someone renames
-  or moves it (or a parent) in SharePoint, syncing carries on with nothing renamed locally, and `folder` in the
-  config is updated to the new path.
+  or moves it (or a parent) in SharePoint, syncing carries on with nothing renamed locally. The config's `folder` is
+  left as written (the tool doesn't rewrite the user's file); it's only used to find the folder the first time.
+  - **Not detected:** a folder moved *into* another library's synced folder in SharePoint. Both libraries then sync
+    the same items. The config check catches this only for the paths as written.
 - **Changes:** the delta still lists the whole drive. Items outside the folder are dropped before reconciling, the
   same way `include` drops them now.
   - Paths are made relative to the folder, so everything else in the engine sees the folder as the root.
   - The first full listing lists the folder only (`children` from its id), not the whole drive.
 - **The folder is gone** (deleted, or no longer shared with you): nothing local is deleted. Syncing stops for that
-  library with "the SharePoint folder `Projects/Specs` is gone or no longer shared with you", and a link to the
-  library's recycle bin.
+  library with "the SharePoint folder `Projects/Specs` is gone, or no longer shared with you", pointing to the
+  recycle bin and to `remove` + `add` for a different folder.
+  - It never re-finds the folder by path by itself: a new folder at the old path would otherwise be treated as a
+    fresh first sync into the existing local copy, and upload files that were deleted in SharePoint.
   - Same rule as a missing local root: a vanished root never deletes the other side.
 - **A local item moved out of the folder** is a delete in SharePoint (recycle bin), as it is for a library today. A
   remote item moved out of the folder is a delete locally.
+  - **Moved in:** delta reports a moved folder but not its contents again, so a folder that's new to the library is
+    listed (`children`, one request per folder in it).
+- **State:** a folder has its own state DB (keyed by drive and folder id), so two folders of one SharePoint library
+  never share state.
 - **Live updates:** unchanged. A notification is per drive, and the delta then filters.
 - **Cost:** one extra lookup per run, only when the folder's path is needed (`access`, `web` links).
 

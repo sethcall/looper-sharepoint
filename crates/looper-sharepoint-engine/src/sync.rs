@@ -127,6 +127,19 @@ impl Report {
 pub struct Resolved {
     pub site_id: String,
     pub drive_id: String,
+    /// The synced folder's item id, for a library limited to `folder`. It's followed by id, so a rename or move in
+    /// SharePoint changes nothing locally.
+    pub folder_id: Option<String>,
+}
+
+impl Resolved {
+    /// The library's state DB. A folder has its own, so two folders of one SharePoint library never share state.
+    pub fn state_db(&self, data_dir: &Path) -> PathBuf {
+        match &self.folder_id {
+            Some(f) => StateDb::path_for(data_dir, &format!("{}/{f}", self.drive_id)),
+            None => StateDb::path_for(data_dir, &self.drive_id),
+        }
+    }
 }
 
 pub async fn resolve(graph: &GraphClient, lib: &Library) -> Result<Resolved> {
@@ -147,7 +160,18 @@ pub async fn resolve(graph: &GraphClient, lib: &Library) -> Result<Resolved> {
             let names: Vec<_> = drives.iter().filter_map(|d| d.name.clone()).collect();
             format!("library {:?} not found in {} (available: {})", lib.library, lib.site, names.join(", "))
         })?;
-    Ok(Resolved { site_id: site.id, drive_id: drive.id.clone() })
+    let folder_id = match &lib.folder {
+        None => None,
+        Some(folder) => match graph.item_by_path(&drive.id, folder).await {
+            Ok(it) if it.is_dir() => Some(it.id),
+            Ok(_) => bail!("{folder:?} in {} is a file; `folder` must be a folder", lib.site),
+            Err(GraphError::NotFound(_)) => {
+                bail!("folder {folder:?} isn't in library {:?} at {} (or you can't see it)", lib.library, lib.site)
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("finding folder {folder:?}"))),
+        },
+    };
+    Ok(Resolved { site_id: site.id, drive_id: drive.id.clone(), folder_id })
 }
 
 /// Sync one configured library once.
@@ -166,8 +190,8 @@ pub async fn sync_library(
         Some(r) => r,
         None => resolve(graph, lib).await?,
     };
-    let local_root = cfg.root().join(&lib.local);
-    let db = StateDb::open(&StateDb::path_for(data_dir, &resolved.drive_id))?;
+    let local_root = cfg.local_root(lib);
+    let db = StateDb::open(&resolved.state_db(data_dir))?;
     crate::index::record(data_dir, lib, &resolved, db.path())?;
 
     let mut s = Sync {
@@ -175,6 +199,7 @@ pub async fn sync_library(
         cfg,
         lib,
         drive_id: resolved.drive_id.clone(),
+        folder_id: resolved.folder_id.clone(),
         root: local_root.clone(),
         db,
         filter: Filter::new(&lib.include, &lib.exclude)?,
@@ -227,6 +252,8 @@ struct Sync<'a> {
     cfg: &'a Config,
     lib: &'a Library,
     drive_id: String,
+    /// The synced folder, for a library limited to `folder`: the root of everything below.
+    folder_id: Option<String>,
     root: PathBuf,
     db: StateDb,
     filter: Filter,
@@ -325,7 +352,8 @@ impl Sync<'_> {
         Ok(())
     }
 
-    /// All delta pages, de-duplicated by id (the last occurrence wins), plus the new deltaLink.
+    /// What changed in SharePoint since the last run (everything, on a full listing), de-duplicated by id, plus the
+    /// new deltaLink. For a folder, only what's inside it: see [`Sync::in_folder`].
     async fn pull_delta(&mut self) -> Result<(Vec<DriveItem>, String)> {
         let mut link = self.db.get_meta(meta::DELTA_LINK)?;
         if link.is_some() && full_sync_due(self.db.get_meta(meta::LAST_FULL_SYNC_AT)?.as_deref(), chrono::Utc::now()) {
@@ -334,37 +362,143 @@ impl Sync<'_> {
         }
         loop {
             self.report.full_enumeration = link.is_none();
-            let mut by_id: HashMap<String, usize> = HashMap::new();
-            let mut items: Vec<Option<DriveItem>> = vec![];
-            let mut next = link.clone();
-            let mut first = true;
-            let result: Result<String> = async {
-                loop {
-                    let page = self.graph.delta_page(&self.drive_id, if first { link.as_deref() } else { next.as_deref() }).await?;
-                    first = false;
-                    for it in page.value {
-                        if let Some(prev) = by_id.insert(it.id.clone(), items.len()) {
-                            items[prev] = None;
-                        }
-                        items.push(Some(it));
-                    }
-                    if let Some(d) = page.delta_link {
-                        return Ok(d);
-                    }
-                    next = Some(page.next_link.context("delta page with neither nextLink nor deltaLink")?);
-                }
-            }
-            .await;
+            let result = match (self.folder_id.clone(), link.as_deref()) {
+                (Some(f), None) => self.list_folder(&f).await,
+                (Some(f), Some(l)) => match self.delta_all(Some(l)).await {
+                    Ok((items, new_link)) => self.in_folder(&f, items).await.map(|items| (items, new_link)),
+                    Err(e) => Err(e),
+                },
+                (None, l) => self.delta_all(l).await,
+            };
             match result {
-                Ok(new_link) => return Ok((items.into_iter().flatten().collect(), new_link)),
                 Err(e) if matches!(e.downcast_ref::<GraphError>(), Some(GraphError::ResyncRequired)) && link.is_some() => {
                     tracing::warn!("delta token expired; re-enumerating library");
                     self.report.resynced = true;
                     link = None;
                 }
-                Err(e) => return Err(e),
+                r => return r,
             }
         }
+    }
+
+    /// All delta pages from `link` (or a full enumeration of the library), de-duplicated by id (the last occurrence
+    /// wins), plus the new deltaLink.
+    async fn delta_all(&mut self, link: Option<&str>) -> Result<(Vec<DriveItem>, String)> {
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        let mut items: Vec<Option<DriveItem>> = vec![];
+        let mut next = link.map(str::to_string);
+        let mut first = true;
+        loop {
+            let page = self.graph.delta_page(&self.drive_id, if first { link } else { next.as_deref() }).await?;
+            first = false;
+            for it in page.value {
+                if let Some(prev) = by_id.insert(it.id.clone(), items.len()) {
+                    items[prev] = None;
+                }
+                items.push(Some(it));
+            }
+            if let Some(d) = page.delta_link {
+                return Ok((items.into_iter().flatten().collect(), d));
+            }
+            next = Some(page.next_link.context("delta page with neither nextLink nor deltaLink")?);
+        }
+    }
+
+    /// A folder's full listing: the folder and everything in it, plus a deltaLink taken *before* listing, so a change
+    /// made while listing is seen again next run rather than missed. (Delta itself only runs from the library's top.)
+    async fn list_folder(&mut self, folder_id: &str) -> Result<(Vec<DriveItem>, String)> {
+        let link = self.graph.delta_latest(&self.drive_id).await?;
+        let folder = match self.graph.item(&self.drive_id, folder_id).await {
+            Ok(f) if f.is_dir() && !f.is_deleted() => f,
+            Ok(_) => bail!(self.folder_gone()),
+            Err(e) if matches!(e, GraphError::NotFound(_)) || e.is_forbidden() => bail!(self.folder_gone()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = vec![folder];
+        out.extend(self.list_subtree(folder_id).await?);
+        Ok((out, link))
+    }
+
+    /// Everything below folder `id` (not the folder itself).
+    async fn list_subtree(&mut self, id: &str) -> Result<Vec<DriveItem>> {
+        let mut out = vec![];
+        let mut queue = vec![id.to_string()];
+        while let Some(id) = queue.pop() {
+            for c in self.graph.children(&self.drive_id, &id).await? {
+                if c.is_dir() {
+                    queue.push(c.id.clone());
+                }
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keep the changes inside the synced folder. Delta lists the whole library, so:
+    /// - an item is inside if its parent chain reaches the folder, through this batch or what's already tracked;
+    /// - a tracked item that's now outside was moved out: it's passed on as deleted;
+    /// - a folder that's new here (moved in from elsewhere, whose contents delta doesn't list again) is listed.
+    async fn in_folder(&mut self, folder_id: &str, items: Vec<DriveItem>) -> Result<Vec<DriveItem>> {
+        if items.iter().any(|it| it.id == folder_id && it.is_deleted()) {
+            bail!(self.folder_gone());
+        }
+        let batch: HashMap<String, DriveItem> = items.iter().map(|it| (it.id.clone(), it.clone())).collect();
+        let mut memo: HashMap<String, bool> = HashMap::new();
+        let mut out = vec![];
+        let mut new_dirs = vec![];
+        for it in items {
+            let known = self.db.get(&it.id)?.is_some();
+            if self.inside(folder_id, &it.id, &batch, &mut memo, 0)? {
+                if it.is_dir() && !it.is_deleted() && !known && it.id != folder_id {
+                    new_dirs.push(it.id.clone());
+                }
+                out.push(it);
+            } else if known {
+                let mut gone = it;
+                gone.deleted = Some(serde_json::json!({}));
+                out.push(gone);
+            }
+        }
+        let mut seen: HashSet<String> = out.iter().map(|it| it.id.clone()).collect();
+        for d in new_dirs {
+            for it in self.list_subtree(&d).await? {
+                if seen.insert(it.id.clone()) {
+                    out.push(it);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn inside(&self, folder_id: &str, id: &str, batch: &HashMap<String, DriveItem>, memo: &mut HashMap<String, bool>, depth: usize) -> Result<bool> {
+        if id == folder_id {
+            return Ok(true);
+        }
+        if let Some(&m) = memo.get(id) {
+            return Ok(m);
+        }
+        let r = match batch.get(id) {
+            // A deletion carries no reliable parent: it matters only if it's tracked.
+            Some(it) if it.is_deleted() => self.db.get(id)?.is_some(),
+            Some(it) => match it.parent_id() {
+                Some(p) if depth < 400 && !it.is_root() => self.inside(folder_id, p, batch, memo, depth + 1)?,
+                _ => false,
+            },
+            // Unchanged: inside if it's tracked (only items inside are).
+            None => self.db.get(id)?.is_some(),
+        };
+        memo.insert(id.to_string(), r);
+        Ok(r)
+    }
+
+    fn folder_gone(&self) -> String {
+        format!(
+            "the SharePoint folder {:?} is gone, or no longer shared with you. Nothing was deleted locally. If it was \
+             deleted, it's in the site's recycle bin; if it moved somewhere you can't see, or you want a different \
+             folder, run `looper-sharepoint remove {}` and add it again",
+            self.lib.folder.as_deref().unwrap_or_default(),
+            self.lib.name()
+        )
     }
 
     /// Write remote state into the DB. Returns ids reported deleted (plus, on a full enumeration, ids not seen).
@@ -381,7 +515,10 @@ impl Sync<'_> {
                 Some(r) => r,
                 None => ItemRow::new(&it.id, "", it.is_dir()),
             };
-            row.is_root = it.is_root();
+            row.is_root = match &self.folder_id {
+                Some(f) => it.id == *f,
+                None => it.is_root(),
+            };
             row.is_dir = it.is_dir();
             row.parent_id = if row.is_root { None } else { it.parent_id().map(str::to_string) };
             row.remote_name = it.name.clone().unwrap_or_default();

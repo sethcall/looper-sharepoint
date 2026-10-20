@@ -412,12 +412,13 @@ pub async fn locate(graph: &GraphClient, cfg: &Config, data_dir: &Path, target: 
         }
         Target::Local(p) => library_for(cfg, p)?,
     };
-    let drive_id = match crate::index::cached(data_dir, lib) {
-        Some(r) => r.drive_id,
-        None => crate::resolve(graph, lib).await?.drive_id,
+    let resolved = match crate::index::cached(data_dir, lib) {
+        Some(r) => r,
+        None => crate::resolve(graph, lib).await?,
     };
+    let drive_id = resolved.drive_id.clone();
     // The sync state knows the item exactly (names can differ locally); otherwise map the names back.
-    let db = StateDb::path_for(data_dir, &drive_id);
+    let db = resolved.state_db(data_dir);
     let known = if db.exists() && !rel.is_empty() {
         StateDb::open(&db).ok().and_then(|d| d.by_local_key(&local_key(&rel)).ok().flatten())
     } else {
@@ -425,10 +426,11 @@ pub async fn locate(graph: &GraphClient, cfg: &Config, data_dir: &Path, target: 
     };
     let id = match known {
         Some(row) => row.item_id,
-        None if rel.is_empty() => "root".to_string(),
+        None if rel.is_empty() => resolved.folder_id.clone().unwrap_or_else(|| "root".to_string()),
         None => {
             let map = cfg.char_map()?;
-            let remote: Vec<String> = rel.split('/').map(|s| map.to_remote(s)).collect();
+            let mut remote: Vec<String> = lib.folder.iter().map(|f| f.to_string()).collect();
+            remote.extend(rel.split('/').map(|s| map.to_remote(s)));
             match graph.item_by_path(&drive_id, &remote.join("/")).await {
                 Ok(it) => it.id,
                 Err(GraphError::NotFound(_)) => bail!("{rel:?} isn't in library {:?} (or you can't see it)", lib.local),
@@ -444,20 +446,19 @@ pub async fn locate(graph: &GraphClient, cfg: &Config, data_dir: &Path, target: 
 fn library_for<'c>(cfg: &'c Config, p: &Path) -> Result<(&'c Library, String)> {
     let abs = std::path::absolute(p)?;
     let abs = abs.canonicalize().unwrap_or(abs);
-    let root = cfg.root();
-    let roots = [root.clone(), root.canonicalize().unwrap_or(root)];
     for lib in &cfg.libraries {
-        for r in &roots {
-            if let Ok(rest) = abs.strip_prefix(r.join(&lib.local)) {
+        let root = cfg.local_root(lib);
+        for r in [root.clone(), root.canonicalize().unwrap_or(root)] {
+            if let Ok(rest) = abs.strip_prefix(&r) {
                 let rel: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
                 return Ok((lib, rel.join("/")));
             }
         }
     }
     bail!(
-        "{} isn't inside a synced library folder (under {}). Use --library NAME PATH for a path in SharePoint",
-        p.display(),
-        cfg.root().display()
+        "{} isn't inside a synced library folder. Use --library NAME PATH for a path in SharePoint \
+         (`looper-sharepoint status` lists the libraries and their folders)",
+        p.display()
     )
 }
 
@@ -509,7 +510,7 @@ impl Links {
 
 /// Where the local copy of a library item is, if it's synced.
 pub fn local_path(cfg: &Config, located: &Located) -> PathBuf {
-    let mut p = cfg.root().join(&located.library.local);
+    let mut p = cfg.local_root(&located.library);
     for seg in located.path.split('/').filter(|s| !s.is_empty()) {
         p.push(seg);
     }

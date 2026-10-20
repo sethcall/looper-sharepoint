@@ -277,7 +277,7 @@ impl Service {
 fn initial_status(cfg: &Config, data_dir: &Path, lib: &Library) -> (LibraryStatus, Vec<RunRecord>) {
     let mut st = LibraryStatus {
         name: lib.local.clone(),
-        local_path: cfg.root().join(&lib.local).display().to_string(),
+        local_path: cfg.local_root(lib).display().to_string(),
         site: lib.site.clone(),
         library: lib.library.clone(),
         state: LibraryState::Idle,
@@ -477,7 +477,7 @@ async fn watch_loop(inner: Arc<Inner>, idx: usize) {
         if *shutdown.borrow() {
             return;
         }
-        let root = inner.cfg.root().join(&lib.cfg.local);
+        let root = inner.cfg.local_root(&lib.cfg);
         // FSEvents reports canonical paths (e.g. /private/tmp for /tmp).
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let (tx, mut rx) = mpsc::unbounded_channel::<notify::Event>();

@@ -38,7 +38,9 @@ root = "~/SharePoint"
 [[library]]
 site    = "https://contoso.sharepoint.com/sites/Engineering"
 library = "Documents"
-local   = "engineering"
+local   = "engineering"                      # a folder under sync.root; or `path = "~/any/folder"` instead
+# folder  = "Projects/Specs"                 # only this folder of the library, its contents directly in the local folder
+# name    = "specs"                          # with `path`: the library's name (default: the last part of `path`)
 # include = ["specs/**", "*.md"]
 # exclude = ["**/~$*", "**/*.tmp"]
 # read_only = true                           # never upload to this library, even with two_way

@@ -543,7 +543,7 @@ fn offline_status(cfg: &Config, data: &Path, history: usize) -> (Status, Vec<Run
     for lib in &cfg.libraries {
         let mut st = LibraryStatus {
             name: lib.local.clone(),
-            local_path: cfg.root().join(&lib.local).display().to_string(),
+            local_path: cfg.local_root(lib).display().to_string(),
             site: lib.site.clone(),
             library: lib.library.clone(),
             state: LibraryState::Idle,

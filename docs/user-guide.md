@@ -94,7 +94,7 @@ Unknown keys are an error, so a typo never silently falls back to a default.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `root` | `~/SharePoint` | Parent folder for all libraries |
+| `root` | `~/SharePoint` | Parent folder for libraries given as `local` |
 | `direction` | `two_way` | `download_only` makes a mirror: local changes are never uploaded, and local edits and deletes are restored from SharePoint |
 | `watch` | `true` | Two-way: upload local changes about 2 s after they settle. If false, they're picked up at the next check |
 | `ignore` | `[]` | Extra glob patterns for files never uploaded (see §6) |
@@ -113,9 +113,15 @@ Unknown keys are an error, so a typo never silently falls back to a default.
 |---|---|
 | `site` | Site URL, e.g. `https://contoso.sharepoint.com/sites/Engineering` |
 | `library` | Library name (as shown in SharePoint) or drive id |
-| `local` | Folder name under `sync.root` |
-| `include` / `exclude` | Optional globs on paths inside the library, e.g. `include = ["specs/**", "*.md"]`. Applied in both directions |
+| `path` | The local folder, anywhere (`~/` allowed), e.g. `path = "~/work/specs"` |
+| `name` | With `path`: what `--library`, `status`, the tray and the logs call it. Defaults to the last part of `path` (`specs`), with `-2` added if that's taken |
+| `local` | The older form, instead of `path`: a folder under `sync.root`, also used as the name |
+| `folder` | Optional: sync only this folder of the library, e.g. `folder = "Projects/Specs"`. Its contents go straight into the local folder, so `Projects/Specs/a.docx` is `<path>/a.docx`. It's found by this path once, then followed even if it's renamed or moved in SharePoint |
+| `include` / `exclude` | Optional globs on paths inside the library (inside `folder`, when set), e.g. `include = ["specs/**", "*.md"]`. Applied in both directions |
 | `read_only` | `true`: never upload to this library, even in two-way mode |
+
+Each library has `path` or `local`. No library's folder may be inside another's, and two libraries can't sync the same
+SharePoint folder (or one inside the other's). Two libraries can sync different folders of one SharePoint library.
 
 ### `[account]`
 

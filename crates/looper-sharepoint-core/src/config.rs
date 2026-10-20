@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use crate::naming::{CharMap, NamingMode};
 
-/// Folder under `sync.root` for local edits that two-way sync set aside instead of uploading.
+/// Folder for local edits that two-way sync set aside instead of uploading: under `sync.root` for libraries given as
+/// `local`, under the data folder for libraries given as `path`.
 pub const SET_ASIDE_DIR: &str = "not-uploaded";
 
 pub const DEFAULT_SCOPES: &[&str] = &[
@@ -219,6 +220,10 @@ pub struct Naming {
     pub char_map: BTreeMap<String, String>,
 }
 
+/// One `[[library]]`: a SharePoint library, or one folder in it, synced to a local folder.
+///
+/// The local folder is either `path` (anywhere), or the older `local` (a folder under `sync.root`). After loading,
+/// `local` always holds the library's name, whichever form the config used: see [`Library::name`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Library {
@@ -226,8 +231,20 @@ pub struct Library {
     pub site: String,
     /// Library display name or drive id.
     pub library: String,
-    /// Folder under `sync.root`.
+    /// Older form: a folder under `sync.root`, which is also the library's name. With `path`, the name (from `name`,
+    /// or the last part of `path`).
+    #[serde(default)]
     pub local: String,
+    /// The local folder, anywhere (`~` allowed).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// With `path`: what commands, status and logs call the library. Defaults to the last part of `path`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Sync only this folder of the library (`/`-separated, from the library's top), its contents directly into the
+    /// local folder.
+    #[serde(default)]
+    pub folder: Option<String>,
     #[serde(default)]
     pub include: Vec<String>,
     #[serde(default)]
@@ -253,12 +270,57 @@ impl Config {
     }
 
     pub fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(text).map_err(|reason| ConfigError::Parse {
+        let mut cfg: Config = toml::from_str(text).map_err(|reason| ConfigError::Parse {
             path: path.to_owned(),
             reason,
         })?;
+        cfg.name_libraries()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Give every library its name (in `local`), and tidy `folder`.
+    fn name_libraries(&mut self) -> Result<(), ConfigError> {
+        let invalid = |m: String| Err(ConfigError::Invalid(m));
+        let explicit: Vec<String> = self
+            .libraries
+            .iter()
+            .map(|l| if l.path.is_some() { l.name.clone().unwrap_or_default() } else { l.local.clone() })
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_lowercase())
+            .collect();
+        let mut taken: std::collections::HashSet<String> = explicit.into_iter().collect();
+        for lib in &mut self.libraries {
+            lib.folder = lib.folder.as_deref().map(|f| f.trim_matches('/').to_string()).filter(|f| !f.is_empty());
+            match (&lib.path, lib.local.is_empty()) {
+                (Some(_), false) => return invalid(format!("library {:?}: use `path` or `local`, not both", lib.local)),
+                (None, true) => return invalid(format!("library at {}: set `path` (the local folder)", lib.site)),
+                (None, false) if lib.name.is_some() => {
+                    return invalid(format!("library {:?}: `name` goes with `path`; with `local`, that's the name", lib.local));
+                }
+                (None, false) => {}
+                (Some(p), true) => {
+                    lib.local = match &lib.name {
+                        Some(n) => n.clone(),
+                        None => {
+                            let base = Path::new(p.trim_end_matches(['/', '\\']))
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "library".into());
+                            let mut name = base.clone();
+                            let mut n = 2;
+                            while taken.contains(&name.to_lowercase()) {
+                                name = format!("{base}-{n}");
+                                n += 1;
+                            }
+                            taken.insert(name.to_lowercase());
+                            name
+                        }
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -305,20 +367,74 @@ impl Config {
         }
         let mut locals = std::collections::HashSet::new();
         for lib in &self.libraries {
-            if lib.local.is_empty() || lib.local.contains("..") || Path::new(&lib.local).is_absolute() {
-                return invalid(format!("library.local {:?} must be a relative folder name", lib.local));
+            if lib.path.is_none() {
+                if lib.local.contains("..") || Path::new(&lib.local).is_absolute() {
+                    return invalid(format!("library.local {:?} must be a relative folder name (use `path` for any folder)", lib.local));
+                }
+                if lib.local.split(['/', '\\']).next().is_some_and(|first| first.eq_ignore_ascii_case(SET_ASIDE_DIR)) {
+                    return invalid(format!("library.local {:?}: {SET_ASIDE_DIR:?} is reserved for files set aside by sync", lib.local));
+                }
+            } else if lib.name.as_deref().is_some_and(|n| n.trim().is_empty() || n.contains(['/', '\\'])) {
+                return invalid(format!("library name {:?} must be a plain name", lib.local));
             }
             if !locals.insert(lib.local.to_lowercase()) {
-                return invalid(format!("library.local {:?} is used twice", lib.local));
+                return invalid(format!("library name {:?} is used twice", lib.local));
             }
-            if lib.local.split(['/', '\\']).next().is_some_and(|first| first.eq_ignore_ascii_case(SET_ASIDE_DIR)) {
-                return invalid(format!("library.local {:?}: {SET_ASIDE_DIR:?} is reserved for files set aside by sync", lib.local));
+            if let Some(f) = &lib.folder
+                && f.split('/').any(|s| s.is_empty() || s == "." || s == "..")
+            {
+                return invalid(format!("library {:?}: folder {f:?} must be a path inside the library, like \"Projects/Specs\"", lib.local));
             }
             for g in lib.include.iter().chain(&lib.exclude) {
                 globset::Glob::new(g).map_err(|e| ConfigError::Invalid(format!("bad glob {g:?}: {e}")))?;
             }
         }
+        self.check_folders()?;
         self.char_map()?;
+        Ok(())
+    }
+
+    /// No library's local folder is inside another's (or the same), or somewhere that can't be a library folder; no
+    /// two libraries sync the same SharePoint folder, or one inside another's.
+    fn check_folders(&self) -> Result<(), ConfigError> {
+        let invalid = |m: String| Err(ConfigError::Invalid(m));
+        let home = dirs::home_dir().map(|h| key(&h));
+        let data = key(&data_dir());
+        let roots: Vec<(&Library, Vec<String>)> = self.libraries.iter().map(|l| (l, key(&self.local_root(l)))).collect();
+        for (i, (lib, k)) in roots.iter().enumerate() {
+            if !self.local_root(lib).is_absolute() {
+                return invalid(format!("library {:?}: path must be absolute or start with ~/", lib.local));
+            }
+            if k.len() <= 1 || home.as_ref() == Some(k) {
+                return invalid(format!("library {:?}: {} can't be a library folder; choose a folder inside it", lib.local, self.local_root(lib).display()));
+            }
+            if k.starts_with(&data) || data.starts_with(k) {
+                return invalid(format!("library {:?}: its folder can't hold, or be inside, looper-sharepoint's data folder", lib.local));
+            }
+            for (other, ok) in &roots[i + 1..] {
+                if k.starts_with(ok) || ok.starts_with(k) {
+                    return invalid(format!(
+                        "libraries {:?} and {:?}: one's folder is inside the other's ({} and {})",
+                        lib.local,
+                        other.local,
+                        self.local_root(lib).display(),
+                        self.local_root(other).display()
+                    ));
+                }
+                let remote = |l: &Library| -> Vec<String> {
+                    let mut v = vec![l.site.trim_end_matches('/').to_lowercase(), l.library.to_lowercase()];
+                    v.extend(l.folder.iter().flat_map(|f| f.split('/')).map(str::to_lowercase));
+                    v
+                };
+                let (a, b) = (remote(lib), remote(other));
+                if a.starts_with(&b) || b.starts_with(&a) {
+                    return invalid(format!(
+                        "libraries {:?} and {:?} sync the same SharePoint folder, or one inside the other",
+                        lib.local, other.local
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -326,15 +442,27 @@ impl Config {
         CharMap::with_overrides(&self.naming.char_map).map_err(ConfigError::Invalid)
     }
 
-    /// `sync.root` with `~` expanded.
-    /// Where two-way sync moves local edits it must not upload (their folder vanished from SharePoint):
-    /// `<root>/not-uploaded/<library>/`.
+    /// Where two-way sync moves local edits it must not upload (SharePoint refused them, or their folder vanished):
+    /// `<root>/not-uploaded/<name>/` for a `local` library, `<data folder>/not-uploaded/<name>/` for a `path` one, so
+    /// nothing appears next to a folder the user chose.
     pub fn set_aside_dir(&self, lib: &Library) -> PathBuf {
-        self.root().join(SET_ASIDE_DIR).join(&lib.local)
+        match lib.path {
+            Some(_) => data_dir().join(SET_ASIDE_DIR).join(&lib.local),
+            None => self.root().join(SET_ASIDE_DIR).join(&lib.local),
+        }
     }
 
+    /// `sync.root` with `~` expanded: the folder `local` libraries live in, and the default parent for new ones.
     pub fn root(&self) -> PathBuf {
         expand_tilde(&self.sync.root)
+    }
+
+    /// The library's local folder.
+    pub fn local_root(&self, lib: &Library) -> PathBuf {
+        match &lib.path {
+            Some(p) => expand_tilde(p),
+            None => self.root().join(&lib.local),
+        }
     }
 
     /// Whether local changes in `lib` are uploaded: two-way sync, and the library isn't read-only.
@@ -342,9 +470,33 @@ impl Config {
         self.sync.direction == Direction::TwoWay && !lib.read_only
     }
 
-    pub fn library(&self, local: &str) -> Option<&Library> {
-        self.libraries.iter().find(|l| l.local.eq_ignore_ascii_case(local))
+    /// The library with this name.
+    pub fn library(&self, name: &str) -> Option<&Library> {
+        self.libraries.iter().find(|l| l.local.eq_ignore_ascii_case(name))
     }
+}
+
+impl Library {
+    /// What commands, status and logs call the library.
+    pub fn name(&self) -> &str {
+        &self.local
+    }
+}
+
+/// A path as lowercased components, `.` and `..` resolved, for comparing folders (macOS and Windows folders are
+/// case-insensitive by default).
+fn key(p: &Path) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str().to_string_lossy().to_lowercase()),
+        }
+    }
+    out
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {
@@ -458,6 +610,48 @@ include = ["specs/**"]
         assert_eq!(c.libraries[0].include, vec!["specs/**"]);
         assert!(parse(&format!("{MIN}{lib}{}", lib.replace("eng\"\ninclude", "ENG\"\ninclude"))).is_err());
         assert!(parse(&format!("{MIN}{}", lib.replace("local = \"eng\"", "local = \"../x\""))).is_err());
+    }
+
+    #[test]
+    fn library_paths_names_and_folders() {
+        let lib = |extra: &str| format!("[[library]]\nsite = \"https://contoso.sharepoint.com/sites/eng\"\nlibrary = \"Documents\"\n{extra}\n");
+        // `path` anywhere; the name is its last part; `folder` tidied.
+        let c = parse(&format!("{MIN}{}", lib("path = \"/foo/bar/\"\nfolder = \"/Projects/Specs/\""))).unwrap();
+        let l = &c.libraries[0];
+        assert_eq!((l.name(), l.folder.as_deref()), ("bar", Some("Projects/Specs")));
+        assert_eq!(c.local_root(l), PathBuf::from("/foo/bar"));
+        assert!(c.set_aside_dir(l).starts_with(data_dir()));
+        // The older form is unchanged.
+        let c = parse(&format!("{MIN}{}", lib("local = \"eng\""))).unwrap();
+        assert_eq!(c.local_root(&c.libraries[0]), c.root().join("eng"));
+        assert_eq!(c.set_aside_dir(&c.libraries[0]), c.root().join("not-uploaded/eng"));
+        // Default names are made unique; explicit ones must be.
+        let two = format!("{MIN}{}{}", lib("path = \"/a/docs\"\nfolder = \"x\""), lib("path = \"/b/docs\"\nfolder = \"y\""));
+        let c = parse(&two).unwrap();
+        assert_eq!((c.libraries[0].name(), c.libraries[1].name()), ("docs", "docs-2"));
+        assert!(parse(&format!("{MIN}{}{}", lib("path = \"/a/x\"\nname = \"n\"\nfolder = \"x\""), lib("path = \"/b/y\"\nname = \"N\"\nfolder = \"y\""))).is_err());
+        // One form only; `name` only with `path`; a folder inside the library.
+        assert!(parse(&format!("{MIN}{}", lib("path = \"/a/x\"\nlocal = \"x\""))).is_err());
+        assert!(parse(&format!("{MIN}{}", lib(""))).is_err());
+        assert!(parse(&format!("{MIN}{}", lib("local = \"x\"\nname = \"y\""))).is_err());
+        assert!(parse(&format!("{MIN}{}", lib("path = \"/a/x\"\nfolder = \"a/../b\""))).is_err());
+        assert!(parse(&format!("{MIN}{}", lib("path = \"relative/x\""))).is_err());
+    }
+
+    #[test]
+    fn library_folders_never_overlap() {
+        let lib = |path: &str, folder: &str| {
+            format!("[[library]]\nsite = \"https://contoso.sharepoint.com/sites/eng\"\nlibrary = \"Documents\"\npath = \"{path}\"\nfolder = \"{folder}\"\n")
+        };
+        assert!(parse(&format!("{MIN}{}{}", lib("/a/x", "one"), lib("/a/y", "two"))).is_ok());
+        // Local folders: one inside the other, or the same (case-insensitively).
+        assert!(parse(&format!("{MIN}{}{}", lib("/a/x", "one"), lib("/a/x/y", "two"))).is_err());
+        assert!(parse(&format!("{MIN}{}{}", lib("/a/x", "one"), lib("/A/X", "two"))).is_err());
+        // SharePoint folders: the same one, or one inside the other.
+        assert!(parse(&format!("{MIN}{}{}", lib("/a/x", "one"), lib("/a/y", "One/sub"))).is_err());
+        // Never the filesystem root or the home folder.
+        assert!(parse(&format!("{MIN}{}", lib("/", "one"))).is_err());
+        assert!(parse(&format!("{MIN}{}", lib("~", "one"))).is_err());
     }
 
     #[test]

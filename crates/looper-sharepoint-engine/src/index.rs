@@ -23,6 +23,11 @@ pub struct Entry {
     pub library: Option<String>,
     #[serde(default)]
     pub site_id: Option<String>,
+    /// The config's `folder`, and the folder's item id it was resolved to.
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
 }
 
 fn file(data_dir: &Path) -> PathBuf {
@@ -47,6 +52,8 @@ pub fn record(data_dir: &Path, lib: &Library, resolved: &Resolved, db_path: &Pat
             site: Some(lib.site.clone()),
             library: Some(lib.library.clone()),
             site_id: Some(resolved.site_id.clone()),
+            folder: lib.folder.clone(),
+            folder_id: resolved.folder_id.clone(),
         },
     );
     save(data_dir, &idx)
@@ -55,8 +62,11 @@ pub fn record(data_dir: &Path, lib: &Library, resolved: &Resolved, db_path: &Pat
 /// The site and drive ids resolved earlier for exactly this config entry, if any.
 pub fn cached(data_dir: &Path, lib: &Library) -> Option<Resolved> {
     let e = load(data_dir).ok()?.remove(&lib.local.to_lowercase())?;
-    (e.site.as_deref() == Some(lib.site.as_str()) && e.library.as_deref() == Some(lib.library.as_str()))
-        .then_some(Resolved { site_id: e.site_id?, drive_id: e.drive_id })
+    (e.site.as_deref() == Some(lib.site.as_str())
+        && e.library.as_deref() == Some(lib.library.as_str())
+        && e.folder == lib.folder
+        && e.folder.is_some() == e.folder_id.is_some())
+        .then_some(Resolved { site_id: e.site_id?, drive_id: e.drive_id, folder_id: e.folder_id })
 }
 
 /// Forget the cached resolution (the drive went away); the next run resolves again. Keeps the DB path for `status`.

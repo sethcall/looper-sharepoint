@@ -36,6 +36,8 @@ struct Harness {
     prefix: String,
     graph: GraphClient,
     drive: String,
+    /// The local folder that `prefix` in SharePoint corresponds to.
+    base: PathBuf,
 }
 
 impl Harness {
@@ -45,31 +47,25 @@ impl Harness {
 
     /// `sync_extra` goes into `[sync]`, `lib_extra` into the `[[library]]` block.
     fn with(sync_extra: &str, lib_extra: &str) -> Self {
+        Self::configured(|prefix, dir, site| {
+            let h = format!("[sync]\nroot = \"{}\"\n{sync_extra}\n", dir.join("root").display());
+            let lib = format!(
+                "[[library]]\nsite = \"{site}\"\nlibrary = \"Documents\"\nlocal = \"qa\"\ninclude = [\"{prefix}/**\"]\n{lib_extra}\n"
+            );
+            (format!("{h}{lib}"), dir.join("root/qa").join(prefix))
+        })
+    }
+
+    /// `libs(prefix, temp dir, site URL)` gives the config after `[account]`, and the local folder for `prefix`.
+    fn configured(libs: impl FnOnce(&str, &Path, &str) -> (String, PathBuf)) -> Self {
         let vars = env();
         let get = |k: &str| vars.get(k).unwrap_or_else(|| panic!("{k} not set")).clone();
         let mut r = [0u8; 4];
         pseudo_random(&mut r);
         let prefix = format!("runs/live-{:08x}", u32::from_le_bytes(r));
         let dir = tempfile::tempdir().unwrap();
-        let config = format!(
-            r#"[account]
-tenant = "{}"
-client_id = "{}"
-[sync]
-root = "{}"
-{sync_extra}
-[[library]]
-site = "{}"
-library = "Documents"
-local = "qa"
-include = ["{prefix}/**"]
-{lib_extra}
-"#,
-            get("TENANT_ID"),
-            get("APP_CLIENT_ID"),
-            dir.path().join("root").display(),
-            get("QA_SITE_URL"),
-        );
+        let (rest, base) = libs(&prefix, dir.path(), &get("QA_SITE_URL"));
+        let config = format!("[account]\ntenant = \"{}\"\nclient_id = \"{}\"\n{rest}", get("TENANT_ID"), get("APP_CLIENT_ID"));
         std::fs::write(dir.path().join("config.toml"), config).unwrap();
         let auth = Authority {
             tenant: get("TENANT_ID"),
@@ -78,15 +74,21 @@ include = ["{prefix}/**"]
         };
         let graph = GraphClient::new(PasswordProvider::new(auth, get("QA_USER_1"), get("QA_USER_1_PASSWORD")));
         let drive = get("QA_DRIVE_ID");
-        Self { vars, dir, prefix, graph, drive }
+        Self { vars, dir, prefix, graph, drive, base }
     }
 
     fn local(&self, rel: &str) -> PathBuf {
-        self.dir.path().join("root/qa").join(&self.prefix).join(rel)
+        self.base.join(rel)
     }
 
     /// Run `looper-sharepoint sync --json`; returns (exit code, report for the library).
     fn sync(&self, extra: &[&str]) -> (i32, Value) {
+        let (code, v) = self.sync_all(extra);
+        (code, v[0].clone())
+    }
+
+    /// Run `looper-sharepoint sync --json`; returns (exit code, the report for every library).
+    fn sync_all(&self, extra: &[&str]) -> (i32, Value) {
         let out = Command::new(env!("CARGO_BIN_EXE_looper-sharepoint"))
             .args(["--json", "sync"])
             .args(extra)
@@ -99,7 +101,7 @@ include = ["{prefix}/**"]
             .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("bad json ({e}): {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
-        (out.status.code().unwrap_or(-1), v["libraries"][0].clone())
+        (out.status.code().unwrap_or(-1), v["libraries"].clone())
     }
 
     async fn put(&self, rel: &str, content: &str) {
@@ -397,5 +399,79 @@ async fn vanished_folder_sets_local_changes_aside() {
     let (code, r) = h.sync(&[]);
     assert_eq!(code, 0, "settles: {r}");
     assert!(!h.exists("secret").await);
+    h.cleanup().await;
+}
+
+/// A library limited to one SharePoint folder, synced directly into a folder of its own: `specs/onboarding-design.md`
+/// §3.1. A second library syncs another folder of the same SharePoint library.
+#[tokio::test]
+async fn folder_as_library_root() {
+    let h = Harness::configured(|prefix, dir, site| {
+        let libs = format!(
+            "[[library]]\nsite = \"{site}\"\nlibrary = \"Documents\"\nfolder = \"{prefix}/proj\"\npath = \"{}\"\n\
+             [[library]]\nsite = \"{site}\"\nlibrary = \"Documents\"\nfolder = \"{prefix}/second\"\npath = \"{}\"\n",
+            dir.join("anywhere/specs").display(),
+            dir.join("elsewhere/second").display(),
+        );
+        (libs, dir.join("anywhere/specs"))
+    });
+    h.put("proj/a.txt", "a1").await;
+    h.put("proj/sub/b.txt", "b1").await;
+    h.put("outside/x.txt", "x1").await;
+    h.put("outside/moving/m.txt", "m1").await;
+    h.put("second/s.txt", "s1").await;
+    h.put("top.txt", "t1").await;
+
+    // Only the folder's contents, straight into the chosen folder; the other library has its own.
+    let (code, all) = h.sync_all(&[]);
+    assert_eq!(code, 0, "{all}");
+    assert_eq!((n(&all[0]["downloaded"]), n(&all[1]["downloaded"])), (2, 1), "{all}");
+    assert_eq!(read(&h.local("a.txt")), "a1");
+    assert_eq!(read(&h.local("sub/b.txt")), "b1");
+    assert_eq!(read(&h.dir.path().join("elsewhere/second/s.txt")), "s1");
+    assert!(!h.local("proj").exists() && !h.local("x.txt").exists() && !h.local("top.txt").exists());
+
+    // Uploads go into the folder.
+    write(&h.local("new.txt"), "new1");
+    write(&h.local("newdir/n.txt"), "n1");
+    let (code, r) = h.sync(&[]);
+    assert_eq!((code, n(&r["uploaded"])), (0, 2), "{r}");
+    assert_eq!(h.remote_text("proj/new.txt").await, "new1");
+    assert_eq!(h.remote_text("proj/newdir/n.txt").await, "n1");
+
+    // Moved in from outside (a file, and a folder whose contents delta doesn't list again); moved out.
+    let proj = h.id("proj").await;
+    let x = h.id("outside/x.txt").await;
+    h.graph.move_item(&h.drive, &x, Some(&proj), None).await.unwrap();
+    let moving = h.id("outside/moving").await;
+    h.graph.move_item(&h.drive, &moving, Some(&proj), None).await.unwrap();
+    let outside = h.id("outside").await;
+    let sub = h.id("proj/sub").await;
+    h.graph.move_item(&h.drive, &sub, Some(&outside), None).await.unwrap();
+    let (code, r) = h.sync(&[]);
+    assert_eq!(code, 0, "{r}");
+    assert_eq!(read(&h.local("x.txt")), "x1", "{r}");
+    assert_eq!(read(&h.local("moving/m.txt")), "m1", "a folder moved in brings its contents: {r}");
+    assert!(!h.local("sub").exists(), "moved out is gone locally: {r}");
+    assert!(h.exists("outside/sub/b.txt").await, "and stays in SharePoint where it went");
+
+    // The folder itself renamed and moved in SharePoint: followed by id, nothing changes locally.
+    h.graph.move_item(&h.drive, &proj, Some(&outside), Some("proj-renamed")).await.unwrap();
+    h.put("outside/proj-renamed/after.txt", "after").await;
+    let (code, r) = h.sync(&[]);
+    assert_eq!(code, 0, "{r}");
+    assert_eq!(n(&r["deleted_local"]), 0, "{r}");
+    assert_eq!(read(&h.local("after.txt")), "after", "{r}");
+    assert_eq!(read(&h.local("a.txt")), "a1");
+
+    // The folder deleted: an error, and nothing local deleted.
+    let renamed = h.id("outside/proj-renamed").await;
+    h.graph.delete_item(&h.drive, &renamed).await.unwrap();
+    let (code, all) = h.sync_all(&[]);
+    assert_eq!(code, 1, "{all}");
+    assert!(all[0]["error"].as_str().unwrap_or("").contains("is gone"), "{all}");
+    assert_eq!(read(&h.local("a.txt")), "a1", "nothing deleted locally");
+    assert_eq!(read(&h.local("moving/m.txt")), "m1");
+
     h.cleanup().await;
 }
